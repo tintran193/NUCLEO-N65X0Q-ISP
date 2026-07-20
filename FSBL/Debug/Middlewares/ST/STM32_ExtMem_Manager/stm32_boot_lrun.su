@@ -1,0 +1,6 @@
+D:/STM32N6_WS/STM32N6_DEMO/Middlewares/ST/STM32_ExtMem_Manager/boot/stm32_boot_lrun.c:53:20:BOOT_Application	16	static
+D:/STM32N6_WS/STM32N6_DEMO/Middlewares/ST/STM32_ExtMem_Manager/boot/stm32_boot_lrun.c:84:20:MapMemory	16	static
+D:/STM32N6_WS/STM32N6_DEMO/Middlewares/ST/STM32_ExtMem_Manager/boot/stm32_boot_lrun.c:118:20:CopyApplication	32	static
+D:/STM32N6_WS/STM32N6_DEMO/Middlewares/ST/STM32_ExtMem_Manager/boot/stm32_boot_lrun.c:193:20:JumpToApplication	80	static,ignoring_inline_asm
+D:/STM32N6_WS/STM32N6_DEMO/Middlewares/ST/STM32_ExtMem_Manager/boot/stm32_boot_lrun.c:244:18:BOOT_GetApplicationSize	16	static
+D:/STM32N6_WS/STM32N6_DEMO/Middlewares/ST/STM32_ExtMem_Manager/boot/stm32_boot_lrun.c:250:17:BOOT_GetApplicationVectorTable	16	static
