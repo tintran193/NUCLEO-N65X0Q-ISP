@@ -1,0 +1,2 @@
+../Core/Src/imx219_reg.c:3:9:IMX219_ReadReg	1
+../Core/Src/imx219_reg.c:17:9:IMX219_WriteReg	1

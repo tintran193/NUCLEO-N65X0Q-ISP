@@ -81,8 +81,6 @@ void Error_Handler(void);
 #define I2C1_SDA_GPIO_Port GPIOC
 #define I2CA_SCL_Pin GPIO_PIN_9
 #define I2CA_SCL_GPIO_Port GPIOH
-#define VCP_RX_Pin GPIO_PIN_6
-#define VCP_RX_GPIO_Port GPIOE
 #define TRACED1_Pin GPIO_PIN_0
 #define TRACED1_GPIO_Port GPIOB
 #define TRACED3_Pin GPIO_PIN_7
@@ -95,8 +93,6 @@ void Error_Handler(void);
 #define TRACED0_GPIO_Port GPIOE
 #define OCTOSPI_IO2_Pin GPIO_PIN_4
 #define OCTOSPI_IO2_GPIO_Port GPION
-#define I2C2_SDA_Pin GPIO_PIN_11
-#define I2C2_SDA_GPIO_Port GPIOB
 #define JTDI_Pin GPIO_PIN_15
 #define JTDI_GPIO_Port GPIOA
 #define OCTOSPI_CLK_Pin GPIO_PIN_6
@@ -113,16 +109,12 @@ void Error_Handler(void);
 #define OCTOSPI_NCS_GPIO_Port GPION
 #define SWCLK_Pin GPIO_PIN_14
 #define SWCLK_GPIO_Port GPIOA
-#define UCPD1_VSENSE_Pin GPIO_PIN_11
-#define UCPD1_VSENSE_GPIO_Port GPIOA
 #define OCTOSPI_IO5_Pin GPIO_PIN_9
 #define OCTOSPI_IO5_GPIO_Port GPION
 #define OCTOSPI_IO0_Pin GPIO_PIN_2
 #define OCTOSPI_IO0_GPIO_Port GPION
 #define SWDIO_Pin GPIO_PIN_13
 #define SWDIO_GPIO_Port GPIOA
-#define I2C2_SCL_Pin GPIO_PIN_10
-#define I2C2_SCL_GPIO_Port GPIOB
 #define SWO_Pin GPIO_PIN_5
 #define SWO_GPIO_Port GPIOB
 #define OCTOSPI_IO6_Pin GPIO_PIN_10

@@ -1,0 +1,7 @@
+../Core/Src/imx219.c:4:9:IMX219_ReadID	3
+../Core/Src/imx219.c:121:9:IMX219_WriteTable	3
+../Core/Src/imx219.c:308:16:IMX219_Configure640x480	8
+../Core/Src/imx219.c:450:16:IMX219_VerifyConfiguration	9
+../Core/Src/imx219.c:578:9:IMX219_Start	1
+../Core/Src/imx219.c:594:9:IMX219_Stop	1
+../Core/Src/imx219.c:610:9:IMX219_Init	6

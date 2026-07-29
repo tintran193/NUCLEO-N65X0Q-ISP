@@ -32,7 +32,7 @@
 
 /* offset of the vector table from the start of the image. Should be set in extmem_conf.h if needed  */
 #ifndef EXTMEM_HEADER_OFFSET
-#define EXTMEM_HEADER_OFFSET 0x400
+#define EXTMEM_HEADER_OFFSET 0
 #endif
 #if defined(EXTMEM_LRUN_TS_ENABLE_NS) && (!defined(EXTMEM_LRUN_DESTINATION_ADDRESS_NS) \
                                       || !defined(EXTMEM_LRUN_SOURCE_ADDRESS_NS))

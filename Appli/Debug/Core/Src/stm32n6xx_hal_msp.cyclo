@@ -1,1 +1,17 @@
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:679:22:LL_MEM_EnableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:1407:22:LL_AHB4_GRP1_EnableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:2273:22:LL_APB1_GRP1_EnableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:2403:22:LL_APB1_GRP1_DisableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:3251:22:LL_APB4_GRP1_EnableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:3319:22:LL_APB4_GRP1_DisableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:3639:22:LL_APB5_GRP1_EnableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:3683:22:LL_APB5_GRP1_DisableClock	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:3703:22:LL_APB5_GRP1_ForceReset	1
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_ll_bus.h:3723:22:LL_APB5_GRP1_ReleaseReset	1
 ../Core/Src/stm32n6xx_hal_msp.c:63:6:HAL_MspInit	1
+../Core/Src/stm32n6xx_hal_msp.c:89:6:HAL_DCMIPP_MspInit	3
+../Core/Src/stm32n6xx_hal_msp.c:142:6:HAL_DCMIPP_MspDeInit	2
+../Core/Src/stm32n6xx_hal_msp.c:170:6:HAL_I2C_MspInit	3
+../Core/Src/stm32n6xx_hal_msp.c:217:6:HAL_I2C_MspDeInit	2
+../Core/Src/stm32n6xx_hal_msp.c:248:6:HAL_UART_MspInit	3
+../Core/Src/stm32n6xx_hal_msp.c:305:6:HAL_UART_MspDeInit	2

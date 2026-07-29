@@ -23,14 +23,19 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_dma.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_dma_ex.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_cortex.h \
+ ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_dcmipp.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_exti.h \
+ ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_i2c.h \
+ ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_i2c_ex.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_pwr.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_pwr_ex.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_uart.h \
  ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_uart_ex.h \
  ../../Drivers/BSP/STM32N6xx_Nucleo/stm32n6xx_nucleo.h \
  ../Core/Inc/stm32n6xx_nucleo_conf.h \
- ../../Drivers/BSP/STM32N6xx_Nucleo/stm32n6xx_nucleo_errno.h
+ ../../Drivers/BSP/STM32N6xx_Nucleo/stm32n6xx_nucleo_errno.h \
+ ../Core/Inc/imx219.h ../Core/Inc/imx219_reg.h ../Core/Inc/imx219_port.h \
+ ../Core/Inc/main.h
 ../Core/Inc/main.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal.h:
 ../Core/Inc/stm32n6xx_hal_conf.h:
@@ -56,7 +61,10 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_dma.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_dma_ex.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_cortex.h:
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_dcmipp.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_exti.h:
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_i2c.h:
+../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_i2c_ex.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_pwr.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_pwr_ex.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal_uart.h:
@@ -64,3 +72,7 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../../Drivers/BSP/STM32N6xx_Nucleo/stm32n6xx_nucleo.h:
 ../Core/Inc/stm32n6xx_nucleo_conf.h:
 ../../Drivers/BSP/STM32N6xx_Nucleo/stm32n6xx_nucleo_errno.h:
+../Core/Inc/imx219.h:
+../Core/Inc/imx219_reg.h:
+../Core/Inc/imx219_port.h:
+../Core/Inc/main.h:

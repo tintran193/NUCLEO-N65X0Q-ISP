@@ -31,7 +31,16 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+extern volatile uint32_t csi_irq_count;
+extern volatile uint32_t dcmipp_irq_count;
+extern volatile uint32_t csi_sr0;
+extern volatile uint32_t csi_sr1;
 
+extern volatile uint32_t csi_ier0;
+extern volatile uint32_t csi_ier1;
+
+extern volatile uint32_t sot_lane0_count;
+extern volatile uint32_t sot_lane1_count;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,7 +64,7 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-
+extern DCMIPP_HandleTypeDef hdcmipp;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -84,7 +93,6 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -212,6 +220,48 @@ void SysTick_Handler(void)
 /* For the available peripheral interrupt handler names,                      */
 /* please refer to the startup file (startup_stm32n6xx.s).                    */
 /******************************************************************************/
+
+/**
+  * @brief This function handles DCMIPP global interrupt.
+  */
+void DCMIPP_IRQHandler(void)
+{
+  /* USER CODE BEGIN DCMIPP_IRQn 0 */
+    dcmipp_irq_count++;
+  /* USER CODE END DCMIPP_IRQn 0 */
+  HAL_DCMIPP_IRQHandler(&hdcmipp);
+  /* USER CODE BEGIN DCMIPP_IRQn 1 */
+
+  /* USER CODE END DCMIPP_IRQn 1 */
+}
+
+/**
+  * @brief This function handles CSI global interrupt.
+  */
+void CSI_IRQHandler(void)
+{
+  /* USER CODE BEGIN CSI_IRQn 0 */
+    uint32_t sr1;
+
+    csi_irq_count++;
+
+    sr1 = CSI->SR1;
+
+    if (sr1 & (1UL << 1))
+    {
+        sot_lane0_count++;
+    }
+
+    if (sr1 & (1UL << 9))
+    {
+        sot_lane1_count++;
+    }
+  /* USER CODE END CSI_IRQn 0 */
+  HAL_DCMIPP_CSI_IRQHandler(&hdcmipp);
+  /* USER CODE BEGIN CSI_IRQn 1 */
+
+  /* USER CODE END CSI_IRQn 1 */
+}
 
 /* USER CODE BEGIN 1 */
 

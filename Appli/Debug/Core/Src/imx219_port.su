@@ -1,0 +1,2 @@
+../Core/Src/imx219_port.c:5:9:IMX219_I2C_ReadReg	48	static
+../Core/Src/imx219_port.c:37:9:IMX219_I2C_WriteReg	48	static
