@@ -9,6 +9,7 @@ RM := rm -rf
 
 # All of the sources participating in the build are defined here
 -include sources.mk
+-include ISP_MW/isp/Src/subdir.mk
 -include Drivers/STM32N6xx_HAL_Driver/subdir.mk
 -include Drivers/BSP/STM32N6xx_Nucleo/subdir.mk
 -include Core/Startup/subdir.mk
@@ -66,7 +67,7 @@ main-build: STM32N6_DEMO_Appli.elf secondary-outputs
 
 # Tool invocations
 STM32N6_DEMO_Appli.elf STM32N6_DEMO_Appli.map: $(OBJS) $(USER_OBJS) D:\STM32N6_WS\STM32N6_DEMO\Appli\STM32N657X0HXQ_LRUN.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "STM32N6_DEMO_Appli.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m55 -T"D:\STM32N6_WS\STM32N6_DEMO\Appli\STM32N657X0HXQ_LRUN.ld" --specs=nosys.specs -Wl,-Map="STM32N6_DEMO_Appli.map" -Wl,--gc-sections -static -Wl,--cmse-implib -Wl,--out-implib=./secure_nsclib.o --specs=nano.specs -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+	arm-none-eabi-gcc -o "STM32N6_DEMO_Appli.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m55 -T"D:\STM32N6_WS\STM32N6_DEMO\Appli\STM32N657X0HXQ_LRUN.ld" --specs=nosys.specs -Wl,-Map="STM32N6_DEMO_Appli.map" -Wl,--gc-sections -static -Wl,--cmse-implib -Wl,--out-implib=./secure_nsclib.o -L../ISP_MW/evision/Lib --specs=nano.specs -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

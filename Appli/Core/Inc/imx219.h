@@ -131,5 +131,7 @@ int32_t IMX219_ReadID(
     uint16_t *id
 );
 
+int32_t IMX219_SetExposure(IMX219_CTX_t *ctx, uint16_t exposure);
+int32_t IMX219_SetGain(IMX219_CTX_t *ctx, uint8_t gain);
 
 #endif /* IMX219_H */

@@ -18,13 +18,15 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "imx219.h"
 #include "imx219_port.h"
 #include <string.h>
+#include "isp_api.h"
+#include "isp_core.h"
+#include "isp_param_conf_imx219.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,7 +42,13 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define FRAME_WIDTH       640U
+#define FRAME_HEIGHT      480U
+#define FRAME_BPP         2U
 
+#define FRAME_BUFFER_SIZE  (FRAME_WIDTH * FRAME_HEIGHT * FRAME_BPP)
+//#define FRAME_BUFFER_SIZE (FRAME_WIDTH * FRAME_HEIGHT * 5 / 4)
+#define CAMERA_BUFFER_ADDR 0x34200000U
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -52,12 +60,14 @@ I2C_HandleTypeDef hi2c2;
 UART_HandleTypeDef hlpuart1;
 
 /* USER CODE BEGIN PV */
-#define FRAME_WIDTH       640U
-#define FRAME_HEIGHT      480U
-#define FRAME_BPP         1U
 
-#define FRAME_BUFFER_SIZE  (FRAME_WIDTH * FRAME_HEIGHT * FRAME_BPP)
-#define CAMERA_BUFFER_ADDR 0x34200000U
+ISP_HandleTypeDef  hcamera_isp;
+
+IMX219_CTX_t imx219_ctx;
+
+static int32_t isp_gain = 0;
+static int32_t isp_exposure = 0;
+
 //__attribute__((aligned(32)))
 //static uint8_t camera_framebuffer[FRAME_BUFFER_SIZE];
 __attribute__((aligned(32)))
@@ -87,6 +97,12 @@ static void MX_DCMIPP_Init(void);
 static void SystemIsolation_Config(void);
 /* USER CODE BEGIN PFP */
 static void Camera_CheckFrameBuffer(void);
+
+static ISP_StatusTypeDef GetSensorInfoHelper(uint32_t Instance, ISP_SensorInfoTypeDef *SensorInfo);
+static ISP_StatusTypeDef SetSensorGainHelper(uint32_t Instance, int32_t Gain);
+static ISP_StatusTypeDef GetSensorGainHelper(uint32_t Instance, int32_t *Gain);
+static ISP_StatusTypeDef SetSensorExposureHelper(uint32_t Instance, int32_t Exposure);
+static ISP_StatusTypeDef GetSensorExposureHelper(uint32_t Instance, int32_t *Exposure);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -102,7 +118,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+	ISP_AppliHelpersTypeDef appliHelpers = {0};
   /* USER CODE END 1 */
 
   /* Enable the CPU Cache */
@@ -148,119 +164,17 @@ int main(void)
 
   HAL_Delay(10);
 
-//  HAL_StatusTypeDef status;
-//
-//  status = HAL_I2C_IsDeviceReady(&hi2c2,
-//                                 IMX219_I2C_ADDR,
-//                                 3,
-//                                 100);
-//
-//  if (status == HAL_OK)
-//  {
-//      printf("IMX219 I2C OK\r\n");
-//  }
-//  else
-//  {
-//      printf("IMX219 I2C FAIL, status = %d\r\n", status);
-//  }
-
-  //=====================Check ID======================
-//  if (IMX219_Init() != HAL_OK)
-//  {
-//      printf("IMX219 initialization failed\r\n");
-//
-//      Error_Handler();
-//  }
-//  else
-//  {
-//      printf("IMX219 initialization OK\r\n");
-//  }
-//
-//  uint16_t camera_id;
-//
-//  if (IMX219_ReadID(&camera_id) == HAL_OK)
-//  {
-//      printf("IMX219 ID = 0x%04X\r\n",
-//             camera_id);
-//  }
-  //IMX219_Init();
-  IMX219_CTX_t imx219_ctx =
-  {
-      .handle = &hi2c2,
-      .ReadReg = IMX219_I2C_ReadReg,
-      .WriteReg = IMX219_I2C_WriteReg
-  };
-
-  uint16_t sensor_id;
-
-  int32_t status;
-
-  status =
-      IMX219_ReadID(
-          &imx219_ctx,
-          &sensor_id
-      );
-
-  printf(
-      "IMX219_ReadID status = %ld\r\n",
-      status
-  );
-
-  printf(
-      "IMX219 ID = 0x%04X\r\n",
-      sensor_id
-  );
-
-  uint8_t value;
-
-  value = 0x00;
-
-  if (IMX219_WriteReg(
-          &imx219_ctx,
-          0x0100,
-          &value,
-          1
-      ) != 0)
-  {
-      printf("Write failed\r\n");
-  }
-  else
-  {
-      printf(
-          "Write OK: REG=0x0100 DATA=0x00\r\n"
-      );
-  }
-
-  value = 0xFF;
-
-  if (IMX219_ReadReg(
-          &imx219_ctx,
-          0x0100,
-          &value,
-          1
-      ) != 0)
-  {
-      printf("Read failed\r\n");
-  }
-  else
-  {
-      printf(
-          "Read OK: REG=0x0100 DATA=0x%02X\r\n",
-          value
-      );
-  }
+  imx219_ctx.handle   = &hi2c2;
+  imx219_ctx.ReadReg  = IMX219_I2C_ReadReg;
+  imx219_ctx.WriteReg = IMX219_I2C_WriteReg;
 
   if (IMX219_Init(&imx219_ctx) != 0)
   {
-      printf(
-          "IMX219 initialization FAILED\r\n"
-      );
+      printf( "IMX219 initialization FAILED\r\n");
   }
   else
   {
-      printf(
-          "IMX219 initialization OK\r\n"
-      );
+      printf("IMX219 initialization OK\r\n");
   }
   /* ============================================================
    * Prepare frame buffer
@@ -268,24 +182,13 @@ int main(void)
 
   printf("\r\n");
   printf("Preparing frame buffer...\r\n");
-
-  printf("Before memset\r\n");
-
-  camera_framebuffer[0] = 0xAA;
-  camera_framebuffer[1] = 0x55;
-
-  printf("After write\r\n");
   /*
    * Clear the buffer before capture.
    *
    * This allows us to determine later whether DCMIPP
    * actually wrote data into it.
    */
-  memset(
-      camera_framebuffer,
-      0x00,
-      FRAME_BUFFER_SIZE
-  );
+  memset(camera_framebuffer,0x00,FRAME_BUFFER_SIZE);
 
 
   /*
@@ -320,7 +223,38 @@ int main(void)
       camera_framebuffer[3]
   );
 
+//
+  /* Fill init struct with Camera driver helpers */
+  appliHelpers.GetSensorInfo = GetSensorInfoHelper;
+  appliHelpers.SetSensorGain = SetSensorGainHelper;
+  appliHelpers.GetSensorGain = GetSensorGainHelper;
+  appliHelpers.SetSensorExposure = SetSensorExposureHelper;
+  appliHelpers.GetSensorExposure = GetSensorExposureHelper;
 
+  /* Initialize the Image Signal Processing middleware */
+  if(ISP_Init(&hcamera_isp, &hdcmipp, 0, &appliHelpers, ISP_IQParamCacheInit[0]) != ISP_OK)
+  {
+	printf("ISP Init failed\r\n");
+    Error_Handler();
+  }
+  printf("ISP Init OK\r\n");
+
+  printf("STAT AREA:\r\n");
+  printf("X0=%lu\r\n", hcamera_isp.statArea.X0);
+  printf("Y0=%lu\r\n", hcamera_isp.statArea.Y0);
+  printf("XSIZE=%lu\r\n", hcamera_isp.statArea.XSize);
+  printf("YSIZE=%lu\r\n", hcamera_isp.statArea.YSize);
+
+  printf("before ISP_Start\r\n");
+
+  if(ISP_Start(&hcamera_isp)!=ISP_OK)
+  {
+      printf("ISP start failed\r\n");
+      Error_Handler();
+  }
+
+  printf("after ISP_Start\r\n");
+//
   /* ============================================================
    * Start DCMIPP snapshot
    * ============================================================ */
@@ -329,23 +263,22 @@ int main(void)
 
   if (HAL_DCMIPP_CSI_PIPE_Start(
           &hdcmipp,
-          DCMIPP_PIPE0,
+          DCMIPP_PIPE1,
           DCMIPP_VIRTUAL_CHANNEL0,
           (uint32_t)camera_framebuffer,
-          DCMIPP_MODE_SNAPSHOT) != HAL_OK)
+          DCMIPP_MODE_CONTINUOUS) != HAL_OK)
   {
-      printf("DCMIPP capture failed\r\n");
-
+      printf("DCMIPP continuous failed\r\n");
       Error_Handler();
   }
+  printf("DCMIPP continuous OK\r\n");
 
   printf("DCMIPP capture started\r\n");
-  printf("Requested framebuffer address = 0x%08lX\r\n",
+  printf("Requested frame buffer address = 0x%08lX\r\n",
          (uint32_t)camera_framebuffer);
-  printf("P0PPM0AR1 = 0x%08lX\r\n", DCMIPP->P0PPM0AR1);
-  printf("P0FCTCR   = 0x%08lX\r\n", DCMIPP->P0FCTCR);
-  printf("P0PPCR    = 0x%08lX\r\n", DCMIPP->P0PPCR);
-  printf("P0PPM0AR1 = 0x%08lX\r\n", DCMIPP->P0PPM0AR1);
+  printf("P1PPM0AR1 = 0x%08lX\r\n", DCMIPP->P1PPM0AR1);
+  printf("P1FCTCR   = 0x%08lX\r\n", DCMIPP->P1FCTCR);
+  printf("P1PPCR    = 0x%08lX\r\n", DCMIPP->P1PPCR);
   printf("CMCR      = 0x%08lX\r\n", DCMIPP->CMCR);
 
   /* ============================================================
@@ -363,6 +296,51 @@ int main(void)
 
   printf("IMX219: streaming started\r\n");
 
+  /* Start the Image Signal Processing */
+  //HAL_Delay(100);
+
+
+//  printf("before ISP_Start\r\n");
+//
+//  if(ISP_Start(&hcamera_isp)!=ISP_OK)
+//  {
+//      printf("ISP start failed\r\n");
+//      Error_Handler();
+//  }
+//
+//  printf("after ISP_Start\r\n");
+
+  /* give the ISP 60 frames to set color balance */
+  while(frame_count < 60)
+  {
+    if (ISP_BackgroundProcess(&hcamera_isp) != ISP_OK)
+    {
+      printf("BGP failed\r\n");
+      BSP_LED_Toggle(LED_RED);
+    }
+  }
+  printf("BGP OK\r\n");
+
+  /* stop the acquisition */
+  HAL_DCMIPP_CSI_PIPE_Stop(&hdcmipp, DCMIPP_PIPE1, DCMIPP_VIRTUAL_CHANNEL0);
+
+
+
+  frame_count = 0;
+  frame_received = 0;
+  /* Start Snapshot again */
+
+  if (HAL_DCMIPP_CSI_PIPE_Start(
+		  &hdcmipp,
+		  DCMIPP_PIPE1,
+		  DCMIPP_VIRTUAL_CHANNEL0 ,
+		  (uint32_t)camera_framebuffer,
+		  DCMIPP_MODE_SNAPSHOT) != HAL_OK)
+  {
+	printf("DCMIPP snapshot failed\r\n");
+    Error_Handler();
+  }
+  printf("DCMIPP snapshot OK\r\n");
 
   /* ============================================================
    * Verify sensor streaming
@@ -431,16 +409,15 @@ int main(void)
 
       if (HAL_DCMIPP_PIPE_GetDataCounter(
               &hdcmipp,
-              DCMIPP_PIPE0,
-              &data_counter
-          ) == HAL_OK)
+              DCMIPP_PIPE1,
+              &data_counter) == HAL_OK)
       {
           printf(
               "DCMIPP data counter = %lu\r\n",
               data_counter
           );
           //
-          printf("P0SR = 0x%08lX\r\n", DCMIPP->P0SR); // Check OK
+          printf("P1SR = 0x%08lX\r\n", DCMIPP->P1SR); // Check OK for PIPE0
       }
       else
       {
@@ -531,24 +508,24 @@ static void MX_DCMIPP_Init(void)
   /** Pipe 1 Config
   */
   pCSI_PipeConfig.DataTypeMode = DCMIPP_DTMODE_DTIDA;
-  pCSI_PipeConfig.DataTypeIDA = DCMIPP_DT_RAW8;
-  pCSI_PipeConfig.DataTypeIDB = DCMIPP_DT_RAW8;
-  if (HAL_DCMIPP_CSI_PIPE_SetConfig(&hdcmipp, DCMIPP_PIPE0, &pCSI_PipeConfig) != HAL_OK)
+  pCSI_PipeConfig.DataTypeIDA = DCMIPP_DT_RAW10;
+  pCSI_PipeConfig.DataTypeIDB = DCMIPP_DT_RAW10;
+  if (HAL_DCMIPP_CSI_PIPE_SetConfig(&hdcmipp, DCMIPP_PIPE1, &pCSI_PipeConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  pCSI_Config.PHYBitrate = DCMIPP_CSI_PHY_BT_450;
+  pCSI_Config.PHYBitrate = DCMIPP_CSI_PHY_BT_220;
   pCSI_Config.DataLaneMapping = DCMIPP_CSI_PHYSICAL_DATA_LANES;
   pCSI_Config.NumberOfLanes = DCMIPP_CSI_TWO_DATA_LANES;
   HAL_DCMIPP_CSI_SetConfig(&hdcmipp, &pCSI_Config);
   pPipeConfig.FrameRate = DCMIPP_FRAME_RATE_ALL;
-  pPipeConfig.PixelPipePitch = 640;
-  pPipeConfig.PixelPackerFormat = DCMIPP_PIXEL_PACKER_FORMAT_MONO_Y8_G8_1;
-  if (HAL_DCMIPP_PIPE_SetConfig(&hdcmipp, DCMIPP_PIPE0, &pPipeConfig) != HAL_OK)
+  pPipeConfig.PixelPipePitch = 1280; //640 for RAW8, 1280 for RGB565
+  pPipeConfig.PixelPackerFormat = DCMIPP_PIXEL_PACKER_FORMAT_RGB565_1;
+  if (HAL_DCMIPP_PIPE_SetConfig(&hdcmipp, DCMIPP_PIPE1, &pPipeConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_DCMIPP_CSI_SetVCConfig(&hdcmipp, 0U, DCMIPP_CSI_DT_BPP8) != HAL_OK)
+  if (HAL_DCMIPP_CSI_SetVCConfig(&hdcmipp, 0U, DCMIPP_CSI_DT_BPP10) != HAL_OK)
   {
     Error_Handler();
   }
@@ -736,7 +713,7 @@ void HAL_DCMIPP_PIPE_FrameEventCallback(
     DCMIPP_HandleTypeDef *hdcmipp,
     uint32_t Pipe)
 {
-    if (Pipe == DCMIPP_PIPE0)
+    if (Pipe == DCMIPP_PIPE1)
     {
         frame_count++;
         frame_received = 1U;
@@ -784,7 +761,7 @@ static void Camera_CheckFrameBuffer(void)
     printf("Checksum       = 0x%08lX\r\n",
            checksum);
 
-    printf("First 32 bytes:\r\n");
+    printf("First 64 bytes:\r\n");
 
     for (uint32_t i = 0U; i < 64U; i++)
     {
@@ -795,6 +772,15 @@ static void Camera_CheckFrameBuffer(void)
             printf("\r\n");
         }
     }
+//    for(int i=0;i<40;i+=5)
+//    {
+//        printf("%02X %02X %02X %02X %02X\r\n",
+//            camera_framebuffer[i],
+//            camera_framebuffer[i+1],
+//            camera_framebuffer[i+2],
+//            camera_framebuffer[i+3],
+//            camera_framebuffer[i+4]);
+//    }
 
     printf("==================================\r\n");
 }
@@ -821,6 +807,83 @@ void HAL_DCMIPP_ErrorCallback(DCMIPP_HandleTypeDef *hdcmipp)
            csi_sr1 & csi_ier1);
 }
 
+static ISP_StatusTypeDef GetSensorInfoHelper(uint32_t Instance,
+                                             ISP_SensorInfoTypeDef *Info)
+{
+    UNUSED(Instance);
+
+    memset(Info,0,sizeof(*Info));
+
+    strcpy(Info->name,"IMX219");
+
+    Info->bayer_pattern = ISP_DEMOS_TYPE_RGGB;
+    Info->color_depth   = 10;
+
+    /* Mode 640x480 */
+    Info->width  = 640;
+    Info->height = 480;
+
+    Info->gain_min = 0;
+    Info->gain_max = 255;
+
+    Info->exposure_min = 1;
+    Info->exposure_max = 1762;      // FrameLength-1 (0x06E3-1)
+
+    return ISP_OK;
+}
+
+static ISP_StatusTypeDef SetSensorGainHelper(uint32_t Instance, int32_t Gain)
+{
+  UNUSED(Instance);
+  isp_gain = Gain;
+  return (ISP_StatusTypeDef) IMX219_SetGain(&imx219_ctx,Gain);
+}
+
+static ISP_StatusTypeDef GetSensorGainHelper(uint32_t Instance, int32_t *Gain)
+{
+  UNUSED(Instance);
+  *Gain = isp_gain;
+  return ISP_OK;
+}
+
+static ISP_StatusTypeDef SetSensorExposureHelper(uint32_t Instance, int32_t Exposure)
+{
+  UNUSED(Instance);
+  isp_exposure = Exposure;
+  return (ISP_StatusTypeDef) IMX219_SetExposure(&imx219_ctx, Exposure);
+}
+
+static ISP_StatusTypeDef GetSensorExposureHelper(uint32_t Instance, int32_t *Exposure)
+{
+  UNUSED(Instance);
+  *Exposure = isp_exposure;
+  return ISP_OK;
+}
+
+/**
+ * @brief  Vsync Event callback on pipe
+ * @param  hdcmipp DCMIPP device handle
+ *         Pipe    Pipe receiving the callback
+ * @retval None
+ */
+void HAL_DCMIPP_PIPE_VsyncEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t Pipe)
+{
+  UNUSED(hdcmipp);
+  /* Update the frame counter and call the ISP statistics handler */
+  switch (Pipe)
+  {
+    case DCMIPP_PIPE0 :
+      ISP_IncDumpFrameId(&hcamera_isp);
+      break;
+    case DCMIPP_PIPE1 :
+      ISP_IncMainFrameId(&hcamera_isp);
+      ISP_GatherStatistics(&hcamera_isp);
+      break;
+    case DCMIPP_PIPE2 :
+      ISP_IncAncillaryFrameId(&hcamera_isp);
+      break;
+  }
+}
 /* USER CODE END 4 */
 
 /**

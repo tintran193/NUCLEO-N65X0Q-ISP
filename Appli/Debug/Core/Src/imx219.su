@@ -5,3 +5,5 @@
 ../Core/Src/imx219.c:578:9:IMX219_Start	24	static
 ../Core/Src/imx219.c:594:9:IMX219_Stop	24	static
 ../Core/Src/imx219.c:610:9:IMX219_Init	24	static
+../Core/Src/imx219.c:713:9:IMX219_SetExposure	24	static
+../Core/Src/imx219.c:727:9:IMX219_SetGain	16	static

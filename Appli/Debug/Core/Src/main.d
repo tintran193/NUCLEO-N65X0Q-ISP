@@ -35,7 +35,10 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Core/Inc/stm32n6xx_nucleo_conf.h \
  ../../Drivers/BSP/STM32N6xx_Nucleo/stm32n6xx_nucleo_errno.h \
  ../Core/Inc/imx219.h ../Core/Inc/imx219_reg.h ../Core/Inc/imx219_port.h \
- ../Core/Inc/main.h
+ ../Core/Inc/main.h ../ISP_MW/isp/Inc/isp_api.h \
+ ../ISP_MW/isp/Inc/isp_core.h ../Core/Inc/isp_conf.h \
+ ../ISP_MW/isp/Inc/isp_platform.h ../ISP_MW/isp/Inc/isp_core.h \
+ ../Core/Inc/isp_param_conf_imx219.h
 ../Core/Inc/main.h:
 ../../Drivers/STM32N6xx_HAL_Driver/Inc/stm32n6xx_hal.h:
 ../Core/Inc/stm32n6xx_hal_conf.h:
@@ -76,3 +79,9 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/imx219_reg.h:
 ../Core/Inc/imx219_port.h:
 ../Core/Inc/main.h:
+../ISP_MW/isp/Inc/isp_api.h:
+../ISP_MW/isp/Inc/isp_core.h:
+../Core/Inc/isp_conf.h:
+../ISP_MW/isp/Inc/isp_platform.h:
+../ISP_MW/isp/Inc/isp_core.h:
+../Core/Inc/isp_param_conf_imx219.h:

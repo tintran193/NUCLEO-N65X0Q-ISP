@@ -5,5 +5,5 @@
 
 USER_OBJS :=
 
-LIBS :=
+LIBS := -ln6-evision-awb_gcc -ln6-evision-awb_iar -ln6-evision-awb_keil -ln6-evision-st-ae_gcc -ln6-evision-st-ae_iar -ln6-evision-st-ae_keil
 

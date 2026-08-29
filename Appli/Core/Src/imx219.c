@@ -183,7 +183,7 @@ static const IMX219_Reg_t imx219_common_regs[] =
     {0x030B,0x01},
     {0x030C,0x00},
     //{0x030D,0x72},
-	{0x030D,0x39},
+	{0x030D,0x1C}, // change here (div 4)
 
 	/* Undocumented registers */
 	{0x455E,0x00},
@@ -300,9 +300,9 @@ static const IMX219_Reg_t imx219_raw10_regs[] =
      * CSI_data_format = 0x0A0A
      */
 
-    {IMX219_REG_CSI_FORMAT_MSB,0x08},
-    {IMX219_REG_CSI_FORMAT_LSB,0x08},
-	{0x0309,0x08}
+    {IMX219_REG_CSI_FORMAT_MSB,0x0A},
+    {IMX219_REG_CSI_FORMAT_LSB,0x0A},
+	{0x0309,0x0A}
 };
 
 static int32_t IMX219_Configure640x480(
@@ -536,7 +536,7 @@ static int32_t IMX219_VerifyConfiguration(
     );
 
     if (
-        value != IMX219_RAW8
+        value != IMX219_RAW10
     )
     {
         return -1;
@@ -566,7 +566,7 @@ static int32_t IMX219_VerifyConfiguration(
 
 
     if (
-        value != IMX219_RAW8
+        value != IMX219_RAW10
     )
     {
         return -1;
@@ -707,4 +707,27 @@ int32_t IMX219_Init(
     );
 
     return 0;
+}
+
+
+int32_t IMX219_SetExposure(IMX219_CTX_t *ctx, uint16_t exposure)
+{
+    uint8_t msb = (exposure >> 8) & 0xFF;
+    uint8_t lsb = exposure & 0xFF;
+
+    if (IMX219_WriteReg(ctx, IMX219_REG_EXPOSURE_MSB, &msb, 1) != 0)
+        return -1;
+
+    if (IMX219_WriteReg(ctx, IMX219_REG_EXPOSURE_LSB, &lsb, 1) != 0)
+        return -1;
+
+    return 0;
+}
+
+int32_t IMX219_SetGain(IMX219_CTX_t *ctx, uint8_t gain)
+{
+    return IMX219_WriteReg(ctx,
+                           IMX219_REG_ANALOG_GAIN,
+                           &gain,
+                           1);
 }
