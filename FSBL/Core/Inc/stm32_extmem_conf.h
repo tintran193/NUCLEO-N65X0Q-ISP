@@ -74,7 +74,18 @@ enum {
 
 #define EXTMEM_LRUN_SOURCE EXTMEMORY_1
 #define EXTMEM_LRUN_SOURCE_ADDRESS  0x00100000u
-#define EXTMEM_LRUN_SOURCE_SIZE     0x10000u
+/*
+ * BOOT_GetApplicationSize() is weak and just returns this constant (see
+ * stm32_boot_lrun.c) -- it does NOT read an actual size from the image.
+ * FSBL therefore blindly memcpy's this many bytes from flash to RAM on
+ * every boot, regardless of how big Appli.bin really is. The previous
+ * value (0x10000 = 64KB) silently truncated Appli: the Debug build of
+ * NUCLEO_N65X0Q_ISP_Appli.elf is already ~114KB, well past that. Bumped
+ * to 256KB for headroom; if Appli grows past that, bump this again (and
+ * check it still fits in RAM alongside EXTMEM_LRUN_DESTINATION_ADDRESS +
+ * this size vs the 2048KB of RAM described in Appli's linker script).
+ */
+#define EXTMEM_LRUN_SOURCE_SIZE     0x40000u
 #define EXTMEM_LRUN_DESTINATION_INTERNAL  1
 #define EXTMEM_LRUN_DESTINATION_ADDRESS 0x34000000u
 

@@ -97,6 +97,8 @@ static void MX_DCMIPP_Init(void);
 static void SystemIsolation_Config(void);
 /* USER CODE BEGIN PFP */
 static void Camera_CheckFrameBuffer(void);
+static void I2C_ScanBus(I2C_HandleTypeDef *hi2c);
+static HAL_StatusTypeDef MX_DCMIPP_ClockConfig(void);
 
 static ISP_StatusTypeDef GetSensorInfoHelper(uint32_t Instance, ISP_SensorInfoTypeDef *SensorInfo);
 static ISP_StatusTypeDef SetSensorGainHelper(uint32_t Instance, int32_t Gain);
@@ -144,13 +146,46 @@ int main(void)
   MX_GPIO_Init();
   MX_LPUART1_UART_Init();
   MX_I2C2_Init();
+  if (MX_DCMIPP_ClockConfig() != HAL_OK)
+  {
+      Error_Handler();
+  }
   MX_DCMIPP_Init();
   SystemIsolation_Config();
   /* USER CODE BEGIN 2 */
   // ==============Check Sensor==========================
-  HAL_GPIO_WritePin(GPIOA,
-                    GPIO_PIN_0,
-                    GPIO_PIN_SET);
+  /*
+   * CAM_NRST (GPIOO_5) and EN_MODULE (GPIOA_0) were never actually
+   * initialized as GPIO outputs anywhere in this file -- MX_GPIO_Init()
+   * only enables port clocks (E/B/A, not even O), it never calls
+   * HAL_GPIO_Init() for any pin. Every HAL_GPIO_WritePin() below was
+   * writing to pins left in whatever state they happened to be in.
+   *
+   * That went unnoticed as long as Appli was loaded fresh over SWD (chip
+   * reset defaults / this board's external pull-up apparently kept
+   * CAM_NRST high anyway). It breaks the moment Appli boots via FSBL:
+   * FSBL reconfigures many GPIOs for its external XSPI flash interface
+   * (likely including port O) before jumping here, and without
+   * explicitly reclaiming these two pins as push-pull outputs, the
+   * camera can end up held in reset / EN_MODULE never actually driven --
+   * matching the symptom (I2C2 ACKs nothing at all, camera's own status
+   * LED never lights). Camera_N6_AI_Test (confirmed working on this same
+   * hardware) explicitly calls HAL_GPIO_Init() for both pins before
+   * touching them; this now does the same.
+   *
+   * Order still matters: release/assert CAM_NRST *before* driving
+   * EN_MODULE high, not after (see Camera_N6_AI_Test's own comments
+   * calling EN_MODULE sequencing "CRITICAL").
+   */
+  __HAL_RCC_GPIOO_CLK_ENABLE();
+  {
+      GPIO_InitTypeDef gpio_nrst = {0};
+      gpio_nrst.Pin   = GPIO_PIN_5;
+      gpio_nrst.Mode  = GPIO_MODE_OUTPUT_PP;
+      gpio_nrst.Pull  = GPIO_NOPULL;
+      gpio_nrst.Speed = GPIO_SPEED_FREQ_LOW;
+      HAL_GPIO_Init(GPIOO, &gpio_nrst);
+  }
 
   HAL_GPIO_WritePin(GPIOO,
                     GPIO_PIN_5,
@@ -162,7 +197,30 @@ int main(void)
                     GPIO_PIN_5,
                     GPIO_PIN_SET);
 
-  HAL_Delay(10);
+  HAL_Delay(10);   /* IMX219 t2 power-up delay */
+
+  /* GPIOA clock is already enabled by MX_GPIO_Init(), but the pin mode
+   * itself still needs to be set -- MX_GPIO_Init() never does that. */
+  {
+      GPIO_InitTypeDef gpio_en = {0};
+      gpio_en.Pin   = GPIO_PIN_0;
+      gpio_en.Mode  = GPIO_MODE_OUTPUT_PP;
+      gpio_en.Pull  = GPIO_NOPULL;
+      gpio_en.Speed = GPIO_SPEED_FREQ_LOW;
+      HAL_GPIO_Init(GPIOA, &gpio_en);
+  }
+
+  HAL_GPIO_WritePin(GPIOA,
+                    GPIO_PIN_0,
+                    GPIO_PIN_SET);
+
+  HAL_Delay(5);    /* EN_MODULE settling, matches Camera_N6_AI_Test */
+
+  /* Diagnostic: scan I2C2 for any responding device before trying the
+   * IMX219 specifically (IMX219_I2C_ADDR = 0x10 << 1 = 0x20). If nothing
+   * shows up at all, the problem is the bus/power/reset wiring to the
+   * camera connector, not the IMX219 driver itself. */
+  I2C_ScanBus(&hi2c2);
 
   imx219_ctx.handle   = &hi2c2;
   imx219_ctx.ReadReg  = IMX219_I2C_ReadReg;
@@ -311,15 +369,63 @@ int main(void)
 //  printf("after ISP_Start\r\n");
 
   /* give the ISP 60 frames to set color balance */
-  while(frame_count < 60)
   {
-    if (ISP_BackgroundProcess(&hcamera_isp) != ISP_OK)
-    {
-      printf("BGP failed\r\n");
-      BSP_LED_Toggle(LED_RED);
-    }
+      uint32_t bgp_start_tick = HAL_GetTick();
+      uint32_t bgp_last_print = bgp_start_tick;
+      uint8_t  bgp_timed_out  = 0U;
+
+      printf("Waiting for AWB/AE warm-up (60 frames, PIPE1 continuous)...\r\n");
+
+      while(frame_count < 60)
+      {
+        if (ISP_BackgroundProcess(&hcamera_isp) != ISP_OK)
+        {
+          printf("BGP failed\r\n");
+          BSP_LED_Toggle(LED_RED);
+        }
+
+        /* This loop used to be able to hang forever with zero output if
+         * DCMIPP never completes a single frame on PIPE1 (frame_count is
+         * only incremented from HAL_DCMIPP_PIPE_FrameEventCallback, which
+         * needs a real frame-complete interrupt). Print progress every
+         * ~1s and bail out with diagnostics after 10s instead of hanging
+         * silently. */
+        if ((HAL_GetTick() - bgp_last_print) >= 1000U)
+        {
+            bgp_last_print = HAL_GetTick();
+            printf("  [warmup] frame_count=%lu  CSI_IRQ=%lu  DCMIPP_IRQ=%lu  "
+                   "SOT_L0=%lu  SOT_L1=%lu\r\n",
+                   frame_count, csi_irq_count, dcmipp_irq_count,
+                   sot_lane0_count, sot_lane1_count);
+        }
+
+        if ((HAL_GetTick() - bgp_start_tick) >= 10000U)
+        {
+            bgp_timed_out = 1U;
+            break;
+        }
+      }
+
+      if (bgp_timed_out)
+      {
+          printf("\r\n");
+          printf("AWB/AE WARMUP TIMEOUT (10s, frame_count=%lu / 60)\r\n",
+                 frame_count);
+          printf("CSI IRQ count    = %lu\r\n", csi_irq_count);
+          printf("DCMIPP IRQ count = %lu\r\n", dcmipp_irq_count);
+          printf("SOT lane0 count  = %lu\r\n", sot_lane0_count);
+          printf("SOT lane1 count  = %lu\r\n", sot_lane1_count);
+          printf("CSI SR0  = 0x%08lX\r\n", CSI->SR0);
+          printf("CSI SR1  = 0x%08lX\r\n", CSI->SR1);
+          printf("P1SR     = 0x%08lX\r\n", DCMIPP->P1SR);
+          printf("CMSR2    = 0x%08lX\r\n", DCMIPP->CMSR2);
+          printf("\r\n");
+      }
+      else
+      {
+          printf("BGP OK\r\n");
+      }
   }
-  printf("BGP OK\r\n");
 
   /* stop the acquisition */
   HAL_DCMIPP_CSI_PIPE_Stop(&hdcmipp, DCMIPP_PIPE1, DCMIPP_VIRTUAL_CHANNEL0);
@@ -407,6 +513,14 @@ int main(void)
       /* ADD HERE */
       uint32_t data_counter = 0U;
 
+      /*
+       * HAL_DCMIPP_PIPE_GetDataCounter() ignores the Pipe argument and
+       * always reads P0DCCNTR (Pipe0's dump counter) regardless of what's
+       * passed here -- an ST HAL limitation, not a bug in this file. Pipe0
+       * is never started in this app, so this will always read 0 for
+       * PIPE1 no matter how the capture actually went. Trust
+       * Camera_CheckFrameBuffer()'s Non-zero-bytes/checksum instead.
+       */
       if (HAL_DCMIPP_PIPE_GetDataCounter(
               &hdcmipp,
               DCMIPP_PIPE1,
@@ -417,7 +531,21 @@ int main(void)
               data_counter
           );
           //
-          printf("P1SR = 0x%08lX\r\n", DCMIPP->P1SR); // Check OK for PIPE0
+          {
+              uint32_t p1sr  = DCMIPP->P1SR;
+              uint32_t cmsr2 = DCMIPP->CMSR2;
+
+              printf("P1SR  = 0x%08lX  (OVRF=%lu LSTFRM=%lu LSTLINE=%lu)\r\n",
+                     p1sr,
+                     (p1sr & DCMIPP_P1SR_OVRF)  ? 1UL : 0UL,
+                     (p1sr & DCMIPP_P1SR_LSTFRM) ? 1UL : 0UL,
+                     (p1sr & DCMIPP_P1SR_LSTLINE) ? 1UL : 0UL);
+              printf("CMSR2 = 0x%08lX  (P1OVRF=%lu)\r\n",
+                     cmsr2,
+                     (cmsr2 & DCMIPP_CMSR2_P1OVRF) ? 1UL : 0UL);
+              printf("PIPE1 OVERRUN: %s\r\n",
+                     (p1sr & DCMIPP_P1SR_OVRF) ? "YES (still broken)" : "no");
+          }
       }
       else
       {
@@ -472,12 +600,58 @@ int main(void)
 //	    HAL_Delay(200);
 //	    BSP_LED_Toggle(LED_BLUE);
 	    HAL_Delay(200);
-	    printf("ok\n");
+	    printf("ok\r\n");
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
+}
+
+/**
+  * @brief  Configure the DCMIPP pixel clock and CSI D-PHY config clock.
+  *
+  * Neither of these was ever configured anywhere in this file before --
+  * MX_DCMIPP_Init() only touches the DCMIPP/CSI peripheral's own config
+  * registers, never RCC. Without a CSI D-PHY reference clock in
+  * particular, the D-PHY receiver just sits in Ultra-Low-Power/idle state
+  * forever: confirmed on hardware via CSI->SR1 showing ULPNCLF/ULPNACTF/
+  * ULPNDL0F/ULPNDL1F all set and SOT_L0/SOT_L1/CSI_IRQ counters staying
+  * at 0 indefinitely (see the AWB/AE warmup-loop diagnostics in main()) --
+  * the sensor's own I2C-configured streaming mode doesn't matter if the
+  * receiver's control clock was never running to begin with. Matches
+  * Camera_N6_AI_Test's MX_DCMIPP_ClockConfig(), confirmed working on this
+  * same hardware/PLL1 tree (PLL1 = 1200MHz on both projects, verified
+  * identical PLLM/N/P1/P2 in each project's FSBL).
+  * @retval HAL_OK or an HAL_RCCEx_PeriphCLKConfig error status.
+  */
+static HAL_StatusTypeDef MX_DCMIPP_ClockConfig(void)
+{
+  RCC_PeriphCLKInitTypeDef clk = {0};
+  HAL_StatusTypeDef ret;
+
+  /* DCMIPP pixel clock via IC17 */
+  clk.PeriphClockSelection = RCC_PERIPHCLK_DCMIPP;
+  clk.DcmippClockSelection = RCC_DCMIPPCLKSOURCE_IC17;
+  clk.ICSelection[RCC_IC17].ClockSelection = RCC_ICCLKSOURCE_PLL1;
+  clk.ICSelection[RCC_IC17].ClockDivider   = 4;    /* PLL1(1200MHz)/4 = 300 MHz */
+  ret = HAL_RCCEx_PeriphCLKConfig(&clk);
+  if (ret != HAL_OK)
+  {
+      return ret;
+  }
+
+  /* CSI D-PHY config clock via IC18 */
+  clk.PeriphClockSelection = RCC_PERIPHCLK_CSI;
+  clk.ICSelection[RCC_IC18].ClockSelection = RCC_ICCLKSOURCE_PLL1;
+  clk.ICSelection[RCC_IC18].ClockDivider   = 60;   /* PLL1(1200MHz)/60 = 20 MHz */
+  ret = HAL_RCCEx_PeriphCLKConfig(&clk);
+  if (ret != HAL_OK)
+  {
+      return ret;
+  }
+
+  return HAL_OK;
 }
 
 /**
@@ -530,6 +704,38 @@ static void MX_DCMIPP_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN DCMIPP_Init 2 */
+
+  /*
+   * PIPE1 IPPlug (AXI write-master) config.
+   *
+   * Without this, PIPE1's AXI client (CLIENT2) is left at its
+   * hardware-reset defaults: effectively no internal FIFO depth and no
+   * outstanding-transaction headroom. The extra latency added by the
+   * ISP Bayer2RGB pipeline stage between the CSI input and the AXI
+   * write is enough for that near-zero buffer to fill up mid-line,
+   * which is what P1SR's Overrun flag and the truncated
+   * "Non-zero bytes" count (see Camera_README.md, PIPE1 section) show:
+   * the pipe stalls a few lines into the frame instead of completing it.
+   * PIPE0 is never started in this app, so it is left unconfigured and
+   * CLIENT2 can safely take the whole FIFO pool.
+   */
+  DCMIPP_IPPlugConfTypeDef pIPPlugConfig = {0};
+  pIPPlugConfig.Client                     = DCMIPP_CLIENT2;
+  pIPPlugConfig.MemoryPageSize             = DCMIPP_MEMORY_PAGE_SIZE_64BYTES;
+  pIPPlugConfig.Traffic                    = DCMIPP_TRAFFIC_BURST_SIZE_128BYTES;
+  pIPPlugConfig.MaxOutstandingTransactions = DCMIPP_OUTSTANDING_TRANSACTION_16;
+  pIPPlugConfig.WLRURatio                  = 15U;
+  pIPPlugConfig.DPREGStart                 = 0x000U;
+  pIPPlugConfig.DPREGEnd                   = 0x3FFU;
+  if (HAL_DCMIPP_SetIPPlugConfig(&hdcmipp, &pIPPlugConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Read back what actually landed in hardware, not just what we asked
+   * for -- confirms the IPPlug fix took effect before any capture starts. */
+  printf("IPPlug CLIENT2: IPC2R1=0x%08lX IPC2R2=0x%08lX IPC2R3=0x%08lX\r\n",
+         DCMIPP->IPC2R1, DCMIPP->IPC2R2, DCMIPP->IPC2R3);
 
   /* USER CODE END DCMIPP_Init 2 */
 
@@ -651,22 +857,28 @@ static void MX_LPUART1_UART_Init(void)
 
   /*RIMC configuration*/
   HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_DCMIPP, &RIMC_master);
-  HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_ETH1, &RIMC_master);
 
-  /* RIF-Aware IPs Config */
-
-  /* set up GPIO configuration */
-  HAL_GPIO_ConfigPinAttributes(GPIOA,GPIO_PIN_10,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOA,GPIO_PIN_11,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_0,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_3,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_6,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_7,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_10,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_11,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_3,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_5,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
-  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_6,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  /*
+   * RIF_MASTER_INDEX_ETH1 and its whole associated GPIO security block
+   * (originally: GPIOA_10/11, GPIOB_0/3/6/7/10/11, GPIOE_3/5/6 all marked
+   * GPIO_PIN_SEC) were removed here.
+   *
+   * This project has no Ethernet driver code anywhere -- it's leftover
+   * CubeMX codegen for a peripheral that isn't actually used. On this
+   * package GPIOB_PIN_10/11 double as I2C2_SCL/I2C2_SDA (see
+   * HAL_I2C_MspInit in stm32n6xx_hal_msp.c), and marking them SEC was
+   * blocking the camera's I2C bus completely: I2C2 ACK'd nothing at any
+   * address at all, not just the IMX219, even though
+   * MX_I2C2_Init()/HAL_I2C_Init() reported success (RIF silently drops
+   * disallowed writes rather than faulting, so the peripheral looked
+   * configured in software but its registers never actually took effect).
+   * Reference project Camera_N6_AI_Test, confirmed working on this same
+   * hardware, has no GPIO RIF calls and no ETH1 master at all -- its
+   * Security_Config() only touches RIMC for DCMIPP/OTG1 and RISC slave
+   * attributes for CSI/DCMIPP/OTG1HS/JPEG. Mirrored that here instead of
+   * guessing pin-by-pin.
+   */
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_CSI, RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
 
   /* USER CODE BEGIN RIF_Init 1 */
   HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_DCMIPP , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
@@ -720,6 +932,67 @@ void HAL_DCMIPP_PIPE_FrameEventCallback(
     }
 }
 
+static void I2C_ScanBus(I2C_HandleTypeDef *hi2c)
+{
+    uint32_t found = 0U;
+    uint8_t  ready[128] = {0};
+
+    printf("\r\n");
+    printf("========== I2C2 BUS SCAN (all 0x00-0x7F) ==========\r\n");
+
+    /* Probe every possible 7-bit address, including the reserved
+     * 0x00-0x02 / 0x78-0x7F range -- listed for completeness even though
+     * real devices won't answer there. HAL wants the 8-bit form (addr<<1). */
+    for (uint16_t addr7 = 0x00U; addr7 <= 0x7FU; addr7++)
+    {
+        if (HAL_I2C_IsDeviceReady(hi2c,
+                                   (uint16_t)(addr7 << 1),
+                                   2U,
+                                   5U) == HAL_OK)
+        {
+            ready[addr7] = 1U;
+            found++;
+        }
+    }
+
+    /* Classic i2cdetect-style grid: one row per 0x_0 address, 16 columns. */
+    printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\r\n");
+    for (uint16_t row = 0U; row < 0x80U; row += 16U)
+    {
+        printf("%02x: ", (unsigned)row);
+        for (uint16_t col = 0U; col < 16U; col++)
+        {
+            uint16_t addr7 = row + col;
+
+            if (ready[addr7])
+            {
+                printf("%02x ", (unsigned)addr7);
+            }
+            else
+            {
+                printf("-- ");
+            }
+        }
+        printf("\r\n");
+    }
+
+    printf("\r\n");
+    if (found == 0U)
+    {
+        printf("No devices found at all. Check camera cable/power/reset wiring.\r\n");
+    }
+    else
+    {
+        printf("Found %lu device(s) total.\r\n", (unsigned long)found);
+    }
+    printf("Expected IMX219 address = 0x%02X (7-bit: 0x%02X) -> %s\r\n",
+           (unsigned)IMX219_I2C_ADDR,
+           (unsigned)(IMX219_I2C_ADDR >> 1),
+           ready[IMX219_I2C_ADDR >> 1] ? "PRESENT" : "NOT FOUND");
+    printf("====================================================\r\n");
+    printf("\r\n");
+}
+
 static void Camera_CheckFrameBuffer(void)
 {
     uint32_t non_zero_count = 0U;
@@ -755,11 +1028,16 @@ static void Camera_CheckFrameBuffer(void)
     printf("Pitch         = %lu bytes\r\n",
            (uint32_t)(FRAME_WIDTH * FRAME_BPP));
 
-    printf("Non-zero bytes = %lu\r\n",
-           non_zero_count);
+    printf("Non-zero bytes = %lu / %lu (%lu%%)\r\n",
+           non_zero_count,
+           (uint32_t)FRAME_BUFFER_SIZE,
+           (uint32_t)((uint64_t)non_zero_count * 100U / FRAME_BUFFER_SIZE));
 
     printf("Checksum       = 0x%08lX\r\n",
            checksum);
+
+    printf("FRAME COMPLETE: %s\r\n",
+           (non_zero_count == (uint32_t)FRAME_BUFFER_SIZE) ? "YES" : "NO (truncated)");
 
     printf("First 64 bytes:\r\n");
 

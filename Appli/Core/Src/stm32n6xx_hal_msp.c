@@ -88,23 +88,31 @@ void HAL_MspInit(void)
   */
 void HAL_DCMIPP_MspInit(DCMIPP_HandleTypeDef* hdcmipp)
 {
-  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
   if(hdcmipp->Instance==DCMIPP)
   {
     /* USER CODE BEGIN DCMIPP_MspInit 0 */
-
+    /*
+     * CubeMX normally regenerates a RCC_PeriphCLKInitTypeDef block right
+     * here (RCC_PERIPHCLK_DCMIPP|RCC_PERIPHCLK_CSI, DCMIPP from PCLK5,
+     * CSI's IC18 from PLL4/1) -- intentionally removed.
+     *
+     * MX_DCMIPP_Init() in main.c now calls MX_DCMIPP_ClockConfig() first,
+     * which routes DCMIPP through IC17 and CSI through IC18 off PLL1
+     * instead (matching Camera_N6_AI_Test, confirmed working on this same
+     * hardware). HAL_DCMIPP_Init() -> HAL_DCMIPP_MspInit() runs right
+     * after that, and this block used to silently overwrite that config
+     * with the CubeMX defaults above since it ran later and touched the
+     * exact same RCC_PERIPHCLK_DCMIPP/RCC_PERIPHCLK_CSI selection -- the
+     * CSI D-PHY was left permanently in Ultra-Low-Power/idle state
+     * (CSI->SR1 ULPNCLF/ULPNACTF/ULPNDL0F/ULPNDL1F all set, SOT_L0/SOT_L1/
+     * CSI_IRQ stuck at 0 indefinitely) because of it, and confirmed on
+     * hardware that this MSP block was the culprit: adding
+     * MX_DCMIPP_ClockConfig() alone changed nothing until this was also
+     * removed. If CubeMX regenerates this file, re-delete this block (or
+     * re-apply the reference project's equivalent USER CODE 0 comment
+     * warning about it).
+     */
     /* USER CODE END DCMIPP_MspInit 0 */
-
-  /** Initializes the peripherals clock
-  */
-    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_DCMIPP|RCC_PERIPHCLK_CSI;
-    PeriphClkInitStruct.DcmippClockSelection = RCC_DCMIPPCLKSOURCE_PCLK5;
-    PeriphClkInitStruct.ICSelection[RCC_IC18].ClockSelection = RCC_ICCLKSOURCE_PLL4;
-    PeriphClkInitStruct.ICSelection[RCC_IC18].ClockDivider = 1;
-    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
-    {
-      Error_Handler();
-    }
 
     /* Peripheral clock enable */
     __HAL_RCC_DCMIPP_CLK_ENABLE();
