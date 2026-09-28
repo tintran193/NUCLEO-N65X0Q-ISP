@@ -404,7 +404,8 @@ ULONG USBD_VIDEO_StreamGetMaxPayloadBufferSize(VOID)
  *
  * At the start of each UVC frame (uvc_frame_offset == 0):
  *   1. Lock the camera double-buffer (held for entire encode duration).
- *   2. Center-crop 640x360 from 640x480: skip top 60 rows.
+ *   2. video_buf is already the cropped 640x360 region (DCMIPP hardware
+ *      crop, see main.c's MX_DCMIPP_Init() -- post-Bug-23, see WORKLOG.md).
  *   3. JPEG-encode directly from video_buf → jpeg_out_buf via HAL polling mode.
  *   4. Release the lock after encode.
  *
@@ -429,9 +430,14 @@ static void fill_uvc_payload(UX_DEVICE_CLASS_VIDEO_STREAM *stream)
     if (uvc_frame_offset == 0U)
     {
         /* Lock camera buffer for full encode duration (no copy buffer).
-         * Center-crop 640x360 from 640x480 by skipping the top/bottom 60 rows. */
+         * Post-Bug-23 (see WORKLOG.md): the 640x360 crop is now done by
+         * DCMIPP's own hardware crop block (main.c's MX_DCMIPP_Init()) --
+         * video_buf[0]/[1] ARE the cropped 640x360 region already, so no
+         * "+60*640*2" row-skip is needed here anymore (that used to skip
+         * past 60 rows of a full 640x480 capture; capturing those rows in
+         * the first place was exactly the wasted RAM this change removes). */
         uvc_locked_buf_idx = VIDEO_GetReadyBufferIdx();
-        uint8_t *src_frame = VIDEO_GetReadyBuffer() + 60U * 640U * 2U;
+        uint8_t *src_frame = VIDEO_GetReadyBuffer();
 
         /* Bug 15-19 diagnostics, no longer needed now that Bug 19's IPPlug
          * fix confirmed the striping fixed (see WORKLOG.md) -- flip to 1 to

@@ -134,4 +134,23 @@ int32_t IMX219_ReadID(
 int32_t IMX219_SetExposure(IMX219_CTX_t *ctx, uint16_t exposure);
 int32_t IMX219_SetGain(IMX219_CTX_t *ctx, uint8_t gain);
 
+/* Dynamic frame-length control (see WORKLOG.md, post-Bug-23 FPS work).
+ * FRM_LENGTH_LINES sets the sensor's per-frame line count (and therefore
+ * FPS at a fixed pixel clock) -- it also caps the maximum valid exposure
+ * (COARSE_INTEGRATION_TIME must stay below it). Fixing it permanently at
+ * the long value needed for dark-scene exposure headroom wastes FPS in
+ * bright light where a short exposure is all that's needed. Callers
+ * should keep the sensor at IMX219_FRAME_LENGTH_SHORT whenever possible
+ * and only grow it (via IMX219_SetFrameLength) when AEC actually requests
+ * an exposure that needs more room, shrinking back down once it doesn't.
+ *   IMX219_FRAME_LENGTH_SHORT:    1763 (0x06E3) -- confirmed on this
+ *     hardware to give ~31fps at this sensor's configured pixel clock.
+ *   IMX219_FRAME_LENGTH_LONG_MAX: 3526 (0x0DC6) -- confirmed ~16fps, the
+ *     current low-light exposure ceiling (matches ../Camera_N6_AI_Test).
+ */
+#define IMX219_FRAME_LENGTH_SHORT     1763U
+#define IMX219_FRAME_LENGTH_LONG_MAX  3526U
+
+int32_t IMX219_SetFrameLength(IMX219_CTX_t *ctx, uint16_t frame_length_lines);
+
 #endif /* IMX219_H */

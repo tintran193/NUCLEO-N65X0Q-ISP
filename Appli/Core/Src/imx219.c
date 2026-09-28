@@ -229,16 +229,20 @@ static const IMX219_Reg_t imx219_common_regs[] =
      * Frame timing
      * ========================================================= */
 
-    /* Bug 18 continued (see WORKLOG.md): FRM_LENGTH_LINES here was 0x06E3
-     * (1763) -- exactly HALF of ../Camera_N6_AI_Test's confirmed-working
-     * 0x0DC6 (3526) for this same 640x480 2-lane 30fps config. A shorter
-     * frame length means less vertical blanking time between frames, which
-     * lines up with the same "someone halved/quartered sensor timing
-     * without adjusting everything else consistently" pattern as the
-     * 0x030D PLL edit above. Restored to match the reference exactly. */
-    /* Frame length lines = 0x0DC6 = 3526 */
-    {0x0160, 0x0D},
-    {0x0161, 0xC6},
+    /* Post-Bug-23 FPS work (see WORKLOG.md): boot at the SHORT frame length
+     * (IMX219_FRAME_LENGTH_SHORT = 1763 = 0x06E3, confirmed ~31fps on this
+     * hardware) instead of statically fixing the long low-light value
+     * (3526, ~16fps) forever. main.c's SetSensorExposureHelper() now grows
+     * FRM_LENGTH_LINES dynamically (IMX219_SetFrameLength()) only when AEC
+     * actually requests an exposure that needs more room than this, and
+     * shrinks it back down once it doesn't -- matching how real camera
+     * drivers (e.g. Raspberry Pi's) avoid paying the low-light FPS cost in
+     * bright scenes. Must match IMX219_FRAME_LENGTH_SHORT in imx219.h and
+     * main.c's current_frame_length initial value -- all three must agree
+     * on what the sensor actually boots at. */
+    /* Frame length lines = 0x06E3 = 1763 */
+    {0x0160, 0x06},
+    {0x0161, 0xE3},
 
     /* Line length pixels = 0x0D78 = 3448 */
     {0x0162, 0x0D},
@@ -387,50 +391,18 @@ static int32_t IMX219_Configure640x480(
     }
 
     /*
-     * Bug 21 (see WORKLOG.md): this explicit write ran AFTER
-     * imx219_common_regs (which sets FRM_LENGTH_LINES via the table --
-     * see Bug 18) and unconditionally overwrote it back to 0x06E3=1763,
-     * silently undoing Bug 18's fix on every single init this whole time.
-     * Both this and the table happened to agree before Bug 18 (both wrong
-     * at 1763), which is exactly why nothing caught the duplication then.
-     * Updated to match the table's corrected value.
-     *
-     * 4. Frame length = 0x0DC6 (3526, see ../Camera_N6_AI_Test)
+     * 4. Frame length -- REMOVED (see WORKLOG.md, Bug 21 and the post-Bug-23
+     * FPS work). This used to be a second, independent write of
+     * FRM_LENGTH_LINES that ran after imx219_common_regs's own table entry
+     * for the same register and unconditionally overwrote it -- a
+     * duplicate-source-of-truth bug (Bug 21) that silently undid Bug 18's
+     * fix for a whole session. Removed entirely rather than kept in sync by
+     * hand a second time: imx219_common_regs's table entry (now
+     * IMX219_FRAME_LENGTH_SHORT = 0x06E3) is the only place this register is
+     * set at init. Runtime changes go through IMX219_SetFrameLength()
+     * (main.c's SetSensorExposureHelper), never a second hardcoded value
+     * here.
      */
-
-    uint8_t frame_length_msb = 0x0D;
-    uint8_t frame_length_lsb = 0xC6;
-
-
-    status =
-        IMX219_WriteReg(
-            ctx,
-            IMX219_REG_FRAME_LENGTH_MSB,
-            &frame_length_msb,
-            1
-        );
-
-
-    if (status != 0)
-    {
-        return status;
-    }
-
-
-    status =
-        IMX219_WriteReg(
-            ctx,
-            IMX219_REG_FRAME_LENGTH_LSB,
-            &frame_length_lsb,
-            1
-        );
-
-
-    if (status != 0)
-    {
-        return status;
-    }
-
 
     /*
      * 5. Exposure = 0x0640
@@ -766,4 +738,18 @@ int32_t IMX219_SetGain(IMX219_CTX_t *ctx, uint8_t gain)
                            IMX219_REG_ANALOG_GAIN,
                            &gain,
                            1);
+}
+
+int32_t IMX219_SetFrameLength(IMX219_CTX_t *ctx, uint16_t frame_length_lines)
+{
+    uint8_t msb = (frame_length_lines >> 8) & 0xFF;
+    uint8_t lsb = frame_length_lines & 0xFF;
+
+    if (IMX219_WriteReg(ctx, IMX219_REG_FRAME_LENGTH_MSB, &msb, 1) != 0)
+        return -1;
+
+    if (IMX219_WriteReg(ctx, IMX219_REG_FRAME_LENGTH_LSB, &lsb, 1) != 0)
+        return -1;
+
+    return 0;
 }

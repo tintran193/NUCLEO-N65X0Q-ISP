@@ -45,7 +45,14 @@ extern "C" {
 
 #define TX_APP_MEM_POOL_SIZE                     (8 * 1024)
 
-#define UX_APP_MEM_POOL_SIZE                     (192 * 1024)
+/* RAM optimization (see WORKLOG.md, post-Bug-23 plan): this backs a byte
+ * pool that only ever serves two allocations -- USBX_MEMORY_STACK_SIZE
+ * (128KB, app_usbx.h) and UX_DEVICE_APP_THREAD_STACK_SIZE (4KB,
+ * app_usbx_device.h) = 132KB actually used. 192KB left ~60KB permanently
+ * unused. Shrunk to 144KB (132KB + ~12KB margin for the byte-pool
+ * allocator's own overhead). If a future change adds another allocation
+ * from ux_app_byte_pool, this must grow to match -- it is not auto-sized. */
+#define UX_APP_MEM_POOL_SIZE                     (144 * 1024)
 
 /* USER CODE BEGIN EC */
 

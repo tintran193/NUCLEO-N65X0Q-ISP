@@ -5,6 +5,734 @@ session can pick up context without re-deriving it. Newest entry on top.
 
 ---
 
+## 2026-09-28 (latest #26) — Retried #16's slew-limiting now that the system is in a clean, well-understood state -- statAreaStatic repositioning ruled out (user confirmed bright sources appear unpredictably, no fixed direction to narrow toward)
+
+**Context**: asked the user where bright sources typically sit in frame, to inform a
+`statAreaStatic` adjustment. Answer: "Không cố định, có thể ở bất kỳ đâu" (not fixed, could be
+anywhere -- camera is handheld/moved freely). This rules out spatial ROI narrowing/repositioning
+as a principled fix -- there's no direction to shrink toward that wouldn't just as often make
+things worse as better for an unpredictable highlight position.
+
+**Reconsidered #16 (slew-limiting) instead of abandoning it**: #16 tried clamping the per-call
+change to `isp_gain`/`isp_exposure` and reporting the slewed value back via `Get*Helper`, tested
+on hardware, and got a WORSE result (image stuck too dark) -- at the time this looked like
+disproof of the whole approach. On reflection: that test ran while Part 1's dynamic frame length
+was STILL fully active (only disabled two steps later in #18), which #18 later proved was itself
+feeding AEC inconsistent frame timing. A slew-limited actuator chasing a target that's ALSO being
+independently perturbed by a second bug cannot converge -- that matches #16's "stuck in a low-mid
+band" symptom without it being a real flaw in slew-limiting. The system is now in a much cleaner,
+better-understood state: Part 1 disabled (#18), Part 2c restored and confirmed not the cause
+(#21/#22), global EV compensation proven the wrong lever and reverted (#25). Root cause is
+narrowed to exactly one clean case: AEC hunts specifically when a real highlight forces a large,
+fast correction from the gain/exposure ceiling. This is a good candidate to retry slew-limiting
+on its own merits -- it's the same technique Raspberry Pi/libcamera's AGC uses for exactly this.
+
+**Change** (`Appli/Core/Src/main.c`, inside the `DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH` branch that
+is currently active per #18): `SetSensorGainHelper()` and `SetSensorExposureHelper()` clamp the
+per-call change to `isp_gain`/`isp_exposure` to `GAIN_SLEW_MAX_STEP=24` /
+`EXPOSURE_SLEW_MAX_STEP=400` (same values as #16 -- full range ramps in ~9-10 calls) before
+writing to the sensor. `Get*Helper` already reads back `isp_gain`/`isp_exposure`, which now hold
+the actually-applied slewed value, not the raw AEC request -- same requirement #16 established.
+
+Build clean, RAM 64.64% (logic-only change).
+
+**Next steps**: flash and retest pointing at the same bright area that triggered hunting before.
+Watch for: (1) smoothed, gradual brightness transition instead of a hard flicker when panning
+into/out of a bright area -- the target outcome; (2) getting stuck too dark again like #16 -- if
+this happens even now, it would mean the slew rate itself needs to be faster (larger
+`*_SLEW_MAX_STEP`), not that the technique is wrong; (3) no visible change at all -- would suggest
+the earlier Stream-based correlation (#21/#22) wasn't fully resolved by physical-handling alone
+and something else is still going on. If slew-limiting doesn't pan out either after this cleaner
+retry, remaining options are accepting the hunting as an inherent limitation of this AEC library
+in backlit/highlight scenes (a known real limitation of simple average-metering autoexposure, not
+unique to this project), or exploring whether `sensorDelay`/other untried `ISP_IQParamTypeDef`
+fields (`isp_core.h`) have any bearing -- not yet investigated.
+
+---
+
+## 2026-09-28 (#25) — -0.5 EV (#24) still too dark; reverted exposureCompensation to 0.0 EV -- global EV shift is the wrong lever for this problem
+
+**Result**: user reports "vẫn tối" (still dark) at `-0.5 EV`. Combined with #24's `-1.0 EV`
+result (fully black), the conclusion is now clear: `exposureCompensation` is a GLOBAL, uniform
+shift applied to every scene equally -- there is no single EV value that keeps normal-light
+scenes properly visible while also being dark enough to prevent hunting when a highlight enters
+frame, because normal-light visibility and highlight-triggered overcorrection are controlled by
+the SAME single number pulling in opposite directions. `0.0 EV` (hunts in bright light, correct
+brightness otherwise) and `-1.0 EV` (never hunts, always too dark) are the two ends actually
+measured on real hardware; `-0.5 EV` sits between and is unsatisfying on both axes rather than
+solving either. This whole EV-compensation direction is retired.
+
+**Reverted** (`Appli/Core/Inc/isp_param_conf_imx219.h`): `.exposureCompensation` back to
+`EXPOSURE_TARGET_0_0_EV` (original brightness restored; hunting-in-bright-light returns, but
+this is a known, better-understood state than an unusable dark camera). `antiFlickerFreq` stays
+at `ANTIFLICKER_50HZ` (unaffected by this, no reason to revert it).
+
+**Why the next fix needs to target `statAreaStatic` instead**: the real problem is that the
+metering window includes both the highlight AND the room's normal dark content, so their average
+swings wildly as a highlight enters/exits -- shrinking or repositioning that window (so a
+highlight is less likely to dominate it, or is excluded from it) attacks the actual mechanism
+instead of just darkening everything as a blunt workaround. This needs to know something about
+the real scene layout to do well (asked the user; see next step) -- guessing a rectangle blind
+risks another wasted flash-test cycle like the last three.
+
+Build clean, RAM 64.64% (config-only change).
+
+**Next steps**: waiting on the user for where bright sources (windows/lights) typically sit in
+frame for this camera's real mounting/use, to choose a `statAreaStatic` adjustment with actual
+justification instead of guessing.
+
+---
+
+## 2026-09-28 (#24) — -1.0 EV (#23) stopped the hunting entirely but overshot to a fully black image in every condition; backed off to -0.5 EV
+
+**Result**: user flashed #23's `-1.0 EV` change and reported the image is now black in EVERY
+condition ("giờ nó đen luôn kg thấy gì cả" -- now it's always black, not scene-dependent). Log
+confirms: `isp_gain=0 isp_exposure=1` (the absolute floor of both) held PERFECTLY steady for the
+entire log (frames=800 through 1248, hundreds of samples, zero drift) -- this is actually a
+valuable positive result buried in the bad outcome: **the hunting is completely gone** (rock
+steady, same character of stability as the "pointed away from bright content" baseline from #22),
+confirming #23's diagnosis and mechanism were right. The problem is purely magnitude: `-1.0 EV`
+(halves the exposure target per `isp_core.c`'s `pow(2, exposureCompensation/2)` formula) pulled
+the target below what even the sensor's minimum gain/exposure can reach, given this metering
+window still averages in the room's normal (non-highlight) content alongside any bright source --
+overshot into permanent floor-clipping instead of landing on a reasonable, stable, visible
+operating point.
+
+**Fix** (`Appli/Core/Inc/isp_param_conf_imx219.h`): `.exposureCompensation` backed off from
+`EXPOSURE_TARGET_MINUS_1_0_EV` to `EXPOSURE_TARGET_MINUS_0_5_EV` -- half the correction. Comment
+updated in place to record the `-1.0 EV` result so a future session doesn't retry it blind.
+`antiFlickerFreq=ANTIFLICKER_50HZ` kept as-is (unrelated to this overshoot).
+
+Build clean, RAM 64.64% (config-only change).
+
+**Next steps**: flash and retest across BOTH normal room light and the bright area/window/light
+that originally triggered hunting. Three possible outcomes: (1) stable AND visible in both --
+done; (2) still visible but hunting returns in bright light -- the -0.5/-1.0 EV bracket has been
+measured (stable-but-black at -1.0, hunting at 0.0), so the right value likely sits at some
+intermediate fraction and may need a value between (this ISP_ExposureCompTypeDef enum only offers
+0.5 EV steps, so -0.5 may need to be it, or accept the residual hunting as the visible-image
+tradeoff); (3) still too dark at -0.5 -- back off further toward `0.0 EV` and reconsider
+`statAreaStatic` (narrowing/repositioning the metering window) as the more targeted fix instead of
+a blanket global exposure shift, since that's what actually determines how much a highlight can
+dominate the average.
+
+---
+
+## 2026-09-28 (#23) — Root cause finally isolated: AEC hunts specifically when the camera is pointed at a bright highlight (confirmed real use case: windows/lights/outdoors), not USB/encode/frame-length; tuned exposureCompensation + antiFlickerFreq (the only real tuning surface available)
+
+**#22's controlled-test request paid off**: user reported the exact discriminator directly --
+"khi tôi kg để cam chĩa vào chỗ có nhiều ánh sáng thì nó tĩnh kg nhảy, khi chĩa ra chỗ sáng thì nó
+nhảy" (stable when NOT pointed at a bright area, jumps when pointed at one). The accompanying log
+shows 450+ consecutive `[UVC_CAP]` samples at `isp_gain=232 isp_exposure=3522` with ZERO drift
+(not pointed at bright content) -- the most stable stretch seen in this entire debugging session,
+confirming the earlier Stream-ON/OFF correlation (#21/#22) really was coincidental (very likely
+just "board handled/moved while watching" vs. "board resting still", as #22 speculated), not a
+USB/JPEG-encode effect. Every theory chased in #15 through #22 (frame-length coupling, gain-
+saturation limit-cycling as a standalone cause, JPEG-encode CPU duration) is now superseded by
+this one: **the trigger is specifically pointing at a bright highlight.**
+
+**Confirmed with the user this is a real use case** (not just a stress test) -- the camera will
+genuinely be pointed at windows/lights/outdoors sometimes, so this needed an actual fix, not just
+documentation of a known limitation.
+
+**Why this happens**: classic failure mode of simple average-luma-metering AEC pointed at a
+partially-saturated highlight. In this room's normal light, `isp_gain`/`isp_exposure` sit pinned
+exactly at the hard ceiling (232/3522) -- itself already an awkward place for any control loop to
+live (a saturation boundary, see #16's writeup on why). When a bright highlight enters the
+`statAreaStatic` metering window (`isp_param_conf_imx219.h`: X0=16,Y0=16,320x240 within the
+640x360 frame -- covers most of the upper 2/3 of frame), AEC needs a large, fast downward
+correction from right at that boundary -- exactly the kind of large-step-from-a-clamped-start that
+produces overshoot/hunting in a simple control loop. Checked `ISP_AECAlgoTypeDef`
+(`isp_core.h:338-344`) directly: it exposes ONLY `enable`, `exposureCompensation`,
+`antiFlickerFreq` -- no damping/speed/hysteresis knob at all, confirming (again) that this
+behavior is baked into the precompiled `libn6-evision-st-ae_gcc.a` binary and cannot be tuned
+from application code beyond these three fields.
+
+**Fix** (`Appli/Core/Inc/isp_param_conf_imx219.h`): using the one legitimate vendor-provided lever
+instead of another app-level workaround (this session already tried and reverted two of those --
+frame-length coupling, slew-limiting -- both fighting the closed-source AEC from outside rather
+than using its own config surface):
+- `.exposureCompensation`: `EXPOSURE_TARGET_0_0_EV` -> `EXPOSURE_TARGET_MINUS_1_0_EV`. Moves the
+  normal-light steady-state target away from the hard ceiling, so normal operation isn't sitting
+  right at the saturation boundary, and shrinks how large a downward correction is needed when a
+  highlight appears.
+- `.antiFlickerFreq`: `0` (disabled) -> `ANTIFLICKER_50HZ` (Vietnam mains). Free, strictly correct
+  for indoor AC-powered lighting (a lit room behind a window, an LED/fluorescent lamp) -- enabled
+  regardless of whether it's the primary cause here, since there was no reason it was off.
+
+Build clean, RAM 64.64% (unaffected -- config-only change, no new storage).
+
+**Next steps**: flash and retest specifically pointing at the same bright area/window/light that
+previously triggered hunting. If still unstable, `exposureCompensation` can be pushed further
+(`EXPOSURE_TARGET_MINUS_1_5_EV` or `-2_0_EV`) at the cost of a dimmer normal-light image; if the
+image is now uncomfortably dark in normal light, dial back toward `-0_5_EV`. If hunting persists
+regardless of exposureCompensation, the next real lever would be `statAreaStatic` itself --
+narrowing/repositioning the metering window to reduce how easily a bright source dominates it
+(scene/mounting-dependent, not a universal fix, would need to know where bright sources typically
+appear in this camera's actual mounting).
+
+---
+
+## 2026-09-28 (#22) — Restoring Part 2c (#21) did NOT fix the oscillation despite cutting JPG_Encode() time ~2.5x; the CPU/encode-duration theory is refuted
+
+**Result**: user flashed #21. `[JPG] enc=... t=10-12ms (cvt=4700-6700us hal=5000-5600us)` confirms
+the hardware YUV422 path is active and working as intended -- encode time dropped from
+~24-28ms to ~10-12ms, roughly the 2.5x cut expected. Despite this, `isp_gain` still alternates
+between `0` and `232` in blocks of a few samples throughout the whole log (`frames=33` through
+`frames=305`, continuously, while streaming) -- same character of oscillation as before #21,
+undiminished in frequency. This refutes #21's theory: whatever disturbs AEC while streaming is
+active is NOT simply proportional to how long `JPG_Encode()` blocks the USBX video-write thread
+-- cutting that blocking window by more than half changed nothing observable.
+
+**Reconsidering the Stream-ON/OFF correlation from #21's log**: that correlation (rock-stable
+during a ~1 minute `Stream OFF` window, oscillating again once `Stream ON` resumed) is still real
+in the data, but with the CPU-duration theory now refuted, the mechanism connecting it to AEC is
+back to unknown. A plausible alternative that has nothing to do with USB/bus contention at all:
+the user was almost certainly holding/handling the board and watching the live video during the
+`Stream ON` windows (recording it with a phone), and likely set it down or stopped touching it
+during the `Stream OFF` gap -- ordinary hand tremor or small repositioning while actively watching
+a live feed is a completely mundane explanation for real, correct AEC responses to real, small
+lighting/framing changes, and would produce exactly this correlation without implicating USB or
+JPEG encoding in any way. This has not been tested and is not yet a conclusion -- flagged
+explicitly because three log-analysis-only theories in a row (frame-length coupling, gain-
+saturation limit-cycling, JPEG-encode-duration) have now each been individually disproven by
+hardware retests, which is a strong signal to stop inferring mechanism from `[UVC_CAP]` log lines
+alone and gather a more controlled data point instead.
+
+**No code change this round.** Requested from the user instead: a controlled test with the board
+resting untouched on a surface, camera pointed at a completely static scene (nothing moving in
+frame, no one handling the board), streaming continuously for at least 20-30s, then report
+whether `isp_gain`/`isp_exposure` still swing between extremes under those conditions. This
+directly discriminates the two remaining candidates -- if it's now stable, physical handling
+during active viewing was the real explanation all along (in which case Part 1-#18 and Part 2c
+were both legitimate, working fixes and nothing further needs chasing); if it still oscillates
+under a fully static, hands-off setup, USB/streaming-linked interference is confirmed real and
+worth continuing to chase (next real test, not yet built: encode every frame from
+`CaptureUVC_Thread` unconditionally, discarding the result, entirely independent of
+`uvc_streaming`/USBX -- isolates JPEG-HW-core+CPU activity from actual USB OTG DMA transfer
+activity, which #21's test could not distinguish).
+
+Part 2c stays restored (`YUV422` hardware pipeline) regardless of this test's outcome -- it is a
+legitimate CPU-time win either way and #22 didn't find any evidence against it, only that it
+wasn't sufficient on its own to explain the remaining oscillation.
+
+---
+
+## 2026-09-28 (#21) — Found the oscillation correlates with active JPEG encode/USB streaming, not with time or scene; restored Part 2c (hardware YUV422) to shrink JPG_Encode()'s per-frame busy window as a targeted fix
+
+**New log, much more informative** (includes a `[UVC] Stream OFF (alt=0)` / re-`Stream ON`
+cycle mid-capture): `isp_gain`/`isp_exposure` swing across almost the FULL range while streaming
+is active -- not just the clean 0/232 alternation seen before, but `exposure` sweeping down to
+`1` (minimum) and back up to `3522` (maximum) within a few samples -- then the instant
+`[UVC] Stream OFF (alt=0)` appears, both values freeze COMPLETELY: 16 consecutive
+`[UVC_CAP]` samples (frames=174 through 590, ~1 minute of real time) all read exactly
+`isp_gain=232 isp_exposure=3522`, not one LSB of drift, while `usb_irq` is also frozen (no USB
+activity). The instant streaming resumes (`Stream ON alt=1` / `transmission_start OK` near the
+end of the log), the pattern of change resumes too. This is a clean, repeated, unambiguous
+correlation: **the oscillation exists only while USB is actively pulling video, not as a function
+of elapsed time or a fixed scene property** -- ruling out "scene is just hard to meter" as the
+(sole) explanation and pointing at something in the active streaming path itself.
+
+**Traced the mechanism**: `ux_device_video.c`'s `fill_uvc_payload()` calls `JPG_Encode()`
+synchronously, once per JPEG frame, directly inside `USBD_VIDEO_StreamPayloadDone()` -- which
+USBX invokes from its own internal `_ux_device_class_video_write_thread_entry` (created at
+`UX_THREAD_PRIORITY_CLASS` = 20, `ux_port.h`) every time an isochronous IN payload finishes. With
+Part 2c reverted (since #17), this log's own `[JPG] enc=... t=24-28ms (cvt=18-22us... hal=5ms)`
+lines show each encode blocking that thread for ~24-28ms, dominated by the software
+`CVT_FormatRgb565ToYuv422Jpeg()` conversion (~18-22ms) -- happening roughly once per frame, i.e.
+~16 times/sec, so up to ~35-45% of all CPU/bus time goes through this one blocking call whenever
+streaming is active. The exact mechanism connecting that busy window to AEC's own convergence
+(ThreadX preemption timing, DCMIPP/JPEG-HW/USB-OTG AXI bus contention delaying the ISP's own
+statistics-extraction hardware, or something else) isn't nailed down with certainty from source
+alone -- but the correlation itself (frozen the instant encoding stops, disturbed the instant it
+resumes) is airtight from this log, regardless of which exact mechanism it is.
+
+**Important scope note on #17's earlier test**: #17 reverted Part 2c and the user reported
+"vẫn y hệt" (no change), which we read at the time as clearing 2c entirely. That test is now
+understood to have been CONFOUNDED: Part 1's dynamic frame length was still fully active at that
+point (only disabled two steps later, in #18) and was almost certainly the dominant source of
+oscillation in that specific test, masking any smaller effect from 2c's encode-duration
+difference. #17's conclusion ("2c doesn't matter") was reasonable given what was known then, but
+wasn't actually a clean test of 2c on its own.
+
+**Fix, restoring Part 2c** (reverting #17's revert): `Appli/Core/Src/main.c`
+(`MX_DCMIPP_Init()`) -- `PixelPackerFormat` back to `DCMIPP_PIXEL_PACKER_FORMAT_YUV422_1`,
+`HAL_DCMIPP_PIPE_SetYUVConversionConfig()`/`HAL_DCMIPP_PIPE_EnableYUVConversion()` re-added
+(BT.601 matrix, same as before, ordering after `SetConfig()` preserved). `Appli/Core/Src/app_threadx.c`
+-- `jpg_conf.fmt_src` back to `JPG_SRC_YUV422`, using the cheap `CVT_FormatYuv422ToYuv422Jpeg()`
+byte-reorder path (no RGB->YUV math) instead of the ~18-22ms software conversion, cutting
+`JPG_Encode()`'s blocking window down toward the ~5ms HW-JPEG-core floor.
+
+Build clean, RAM 64.64% (unaffected -- `mcu_buffer` size is independent of source pixel format,
+consistent with every previous round touching this).
+
+**Next steps**: flash and retest, specifically watching `isp_gain`/`isp_exposure` WHILE actively
+streaming (not just at boot) -- the key question is whether shrinking the encode window
+eliminates the while-streaming oscillation or only reduces its magnitude/frequency. If it's not
+fully gone, the busy-window theory is confirmed directionally but insufficient alone, and the
+next step would be decoupling `JPG_Encode()` from the USBX video-write thread entirely (encode in
+`CaptureUVC_Thread` instead, handing the USBX thread only a ready-made JPEG buffer to drip-feed)
+so no matter how long encoding takes, it can no longer compete with whatever is disturbing AEC.
+
+---
+
+## 2026-09-28 (#20) — #19's fixed 1.5s settle delay wasn't long enough for a dark test scene; replaced with convergence-based waiting (poll until isp_gain/isp_exposure hold steady, capped by a timeout)
+
+**Symptom**: user flashed #19 and pointed the camera at a dark ceiling with a bare light tube (a
+deliberately high-contrast, mostly-dark scene) -- still saw flicker, and reported the image now
+also looks darker. Log confirms: at `frames=16` (~1s in) and `frames=32` (~2s in), `isp_gain` is
+still `0` (not yet ramped to what this scene needs); `[UVC] transmission_start OK` (USB actually
+starts sending video to the viewer) happens in this same early window, so the viewer was still
+watching AEC's gain=0->232 ramp live -- the exact thing #19 was meant to hide. Only by
+`frames=48` (~3s in) does it reach `isp_gain=232, isp_exposure=3522` and hold there steadily for
+the rest of the log (5 consecutive samples, no oscillation) -- so the underlying sustained-
+oscillation bug (#15-#18) really is fixed; what's left is purely that #19's fixed 1.5s guess was
+too short for this specific dark scene, and the "darker" look is this scene's own genuinely low
+average brightness pinning gain/exposure at their hard ceiling (already the sensor's physical
+limit at the current fixed frame length -- nothing left to give without sacrificing FPS further).
+
+**Why a fixed duration can't be right**: how long AEC needs to reach the correct operating point
+depends entirely on how far the real scene's target is from the cold-boot default
+(`isp_gain=0`, `isp_exposure=1600`) -- a bright scene needs almost no ramp, a very dark one (like
+this test) needs the full walk to the ceiling. No single constant fits both.
+
+**Fix** (`Appli/Core/Src/app_threadx.c`, `CaptureUVC_Thread()`): replaced the fixed 1.5s loop
+with a convergence poll -- keep pumping `ISP_BackgroundProcess()` (20ms steps) until
+`isp_gain`/`isp_exposure` have both held exactly steady for `AEC_SETTLE_STABLE_STEPS=20`
+consecutive steps (~400ms unchanged), which ordinary AEC dither is too small/fast to satisfy by
+accident, so this reliably means "the boot ramp is over, not just between two dither samples".
+Capped by `AEC_SETTLE_TIMEOUT_MS=4000` so a scene that never truly settles (e.g. an actually
+flickering light source, or an AEC edge case) cannot delay stream start forever -- it streams
+anyway past that point rather than hanging. Added a one-time
+`[UVC_CAP] AEC settle: <ms>, gain=... exposure=...` printf so the actual convergence time (and
+whether it timed out) is visible in the log on future tests, instead of guessing blind again.
+
+Build clean, RAM 64.59% (unaffected -- still a boot-time-only loop, no new storage).
+
+**Next steps**: flash and retest, including specifically with a dark/high-contrast scene like the
+one that exposed #19's gap. Check the new `[UVC_CAP] AEC settle:` log line -- if it reports
+"(timed out)" often, `AEC_SETTLE_TIMEOUT_MS`/`AEC_SETTLE_STABLE_STEPS` may need retuning; if
+convergence time is consistently much less than 4s, the timeout could be tightened to reduce
+worst-case boot latency. Separately: the "darker" image in a scene like the ceiling/light-tube
+test is expected given the sensor is already at its gain/exposure ceiling for the current fixed
+frame length -- not a new bug, and not further fixable without either accepting more noise
+(pushing analog gain past its documented ceiling, already ruled out in Bug 22) or trading more
+FPS for a longer frame length (more exposure headroom).
+
+---
+
+## 2026-09-28 (#19) — Compared against ST's official STM32N6_Face_Recognition (IMX335, stm32-mw-camera) to answer: why 16fps here vs 30fps there, and why that project doesn't run out of RAM at high resolution; added an AEC settle delay for the remaining ~1-2s boot flicker
+
+**Context**: user confirmed #18's fix worked (flicker gone except ~1-2s at boot), then asked two
+architecture questions, initially pointing at `STM32N6_Face_Detection` (a bare FSBL/NPU/AXISRAM
+bring-up skeleton with NO camera code at all, confirmed by its own README and a repo-wide grep --
+not a valid comparison target). User redirected to `STM32N6_Face_Recognition`
+(`Application/STM32N6570-DK/`), ST's official face-recognition demo, which does have a full
+camera pipeline (`Middlewares/stm32-mw-camera`, IMX335).
+
+**Why IMX335 hits 30fps and IMX219 was stuck at 16fps here**: NOT a sensor capability gap --
+this project's own earlier hardware testing already proved IMX219 hits ~31fps at
+`FRM_LENGTH_LINES=1763` (matches IMX335's 30fps almost exactly); 16fps is only what #18's fix
+pins for guaranteed low-light exposure headroom. The real lesson is architectural, confirmed by
+reading ST's own sensor driver source
+(`Middlewares/stm32-mw-camera/sensors/imx335/imx335.c:195-218,719-753`): it ships five
+pre-validated register tables (`framerate_10/15/20/25/30fps_regs`, each writing VMAX registers
+0x3030/0x3031 -- IMX335's exact equivalent of IMX219's FRM_LENGTH_LINES). FPS is a MODE selected
+ONCE via `IMX335_SetFrameRate()` before streaming starts (`app_camerapipeline.c:122`,
+`CAMERA_FPS 30`) -- there is no code path anywhere in this reference project that changes VMAX
+while AEC is actively running. This matches Raspberry Pi/libcamera's real design too (a fixed
+per-mode frame duration; AGC only ever trades exposure/gain within it). This project's entire
+flicker saga (original Part 1 continuous recompute, #15's hysteresis, #16's slew-limiting) was
+fighting this same lesson from three different angles: evision's precompiled AEC was never
+designed to tolerate its own frame timing changing underneath it while running, no matter how
+gently. #18's fix (pin frame length, never touch it live) isn't a workaround -- it's the
+architecturally correct thing, confirmed by how ST's own reference sensor driver does it.
+**Implication for later, if 30fps in normal light is wanted back**: implement FAST/SLOW as two
+fixed profiles chosen ONCE (e.g. at boot from an initial light read, or by explicit user trigger),
+never by AEC mid-session -- accept that a mode switch is a discrete event (brief re-init), not a
+seamless live adjustment.
+
+**Why that project doesn't run out of RAM at high resolution**: two independent, compounding
+reasons, both confirmed from source, not assumed:
+1. **Different pipeline shape.** `app_camerapipeline.c`'s `DCMIPP_PipeInitDisplay()` /
+   `DCMIPP_PipeInitNn()` configure DCMIPP's two hardware output pipes to downscale directly from
+   the sensor into (a) an LCD-display-sized RGB565 buffer and (b) a tiny AI-model-input-sized
+   buffer (`STAI_NETWORK_IN_1_WIDTH/HEIGHT`, typically ~128-256px) -- there is no software JPEG
+   encoder, no MCU-block staging buffer, and no full-resolution frame ever held in RAM. It's a
+   local-display + on-device-inference demo, not a USB UVC webcam -- it never needs to produce a
+   full-resolution encoded frame at all, which is the entire source of this project's RAM cost
+   (`video_buf1`, `mcu_buffer`). Not a fairer/smarter design for our use case, just a different
+   task with a genuinely smaller memory requirement.
+2. **Different board hardware.** `Application/STM32N6570-DK/STM32CubeIDE/STM32N657xx.ld`:
+   `PSRAM (xrw): ORIGIN = 0x91000000, LENGTH = 16M` -- the STM32N6570-DK Discovery Kit has an
+   onboard 32MB APS256XX PSRAM chip (16MB of it mapped/used here) on top of ~1MB+ of internal
+   AXISRAM. This project's own existing comments already established the NUCLEO-N65X0Q-ISP board
+   has **no PSRAM at all** (`app_jpg.c:45`, `app_threadx.c:24`: "no PSRAM on target board") --
+   ~2MB internal SRAM total is genuinely everything available here, vs. 16MB+ extra external
+   memory on that board. Even if this project needed to buffer full frames the way it does now,
+   that board could absorb it trivially; this one cannot.
+
+**Residual boot flicker (~1-2s)**: with frame length now fixed throughout streaming (#18), this
+is no longer the same bug -- almost certainly just AEC's normal convergence transient from its
+cold-boot defaults (`isp_gain=0`, `isp_exposure=1600`, `main.c`) to whatever the real room needs,
+which every camera app shows briefly when first opened; the only reason it was VISIBLE here is
+that USB started transmitting frames to the viewer immediately, before AEC had a chance to
+converge somewhere nobody's watching. Fix (`Appli/Core/Src/app_threadx.c`,
+`CaptureUVC_Thread()`): added a ~1.5s loop pumping `ISP_BackgroundProcess()` (20ms steps) right
+before `uvc_capture_active = 1U` -- delays USB stream start by ~1.5s but should let AEC settle
+before any frame reaches the viewer. The 1.5s figure is a guess (no way to directly observe
+convergence progress from outside); adjust if boot flicker persists or the extra wait feels too
+long.
+
+Build clean, RAM 64.58% (unaffected -- this is a boot-time delay loop, no new storage).
+
+**Next steps**: flash and confirm the boot flicker is gone (or reduced) and note whether ~1.5s
+feels right. Decide separately (no code changed for this yet) whether the FAST/SLOW fixed-profile
+mode-switch idea above is worth implementing to recover ~31fps in bright rooms, given it can only
+ever be a discrete/explicit switch, never a live AEC-driven one.
+
+---
+
+## 2026-09-28 (#18) — Part 2c reverted but flicker/darkness identical (confirmed by user); isolating Part 1 (dynamic frame length) next by disabling it entirely via a debug gate
+
+**Result of #17's isolation test**: user flashed the Part 2c revert (RGB565 + no hardware YUV
+conversion) and reported "vẫn y hệt" -- still exactly the same symptom. This formally CLEARS
+Part 2c (the DCMIPP hardware YUV422 color-conversion pipeline) as a cause -- it was not disturbing
+AEC/AWB metering after all, so its "upstream, should be independent" comment was actually correct
+this time (unlike Bug 23's case). No need to re-investigate 2c further; it can be safely
+re-applied once the real cause is found and confirmed unrelated.
+
+**Narrowing further**: this leaves Part 1 (dynamic frame length + #15's hysteresis) and Part 2a
+(hardware crop to 640x360) as the only remaining changes from this round that could explain the
+flicker. Rather than guess again, isolate Part 1 directly: added a debug gate
+`DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH` (`Appli/Core/Src/main.c`, set to `1`) that short-circuits
+`SetSensorExposureHelper()` to skip ALL frame-length switching and hysteresis logic, permanently
+pinning `FRM_LENGTH_LINES` at `IMX219_FRAME_LENGTH_LONG_MAX` (3526) -- i.e. behaving exactly like
+the code did before Part 1 was ever introduced (fixed ~16fps ceiling, but that config was
+confirmed stable with correct color/exposure convergence back in the Bug 20-23 testing rounds).
+Exposure itself is still written every call via `IMX219_SetExposure()`, unchanged -- only the
+frame-length dynamics are removed.
+
+**This is a clean either/or test**:
+1. Flicker/darkness disappears -> Part 1's frame-length dynamics is the real cause (even with
+   #15's hysteresis debounce, something about writing `FRM_LENGTH_LINES` dynamically at all is
+   still disturbing AEC). Would need a fundamentally different approach than hysteresis tuning --
+   possibly accept the fixed ~16fps ceiling as the practical answer, since every attempt to make
+   frame length dynamic (continuous recompute in the original Part 1, then hysteresis in #15) has
+   made things worse or not fixed it.
+2. Flicker/darkness persists identically -> Part 1 is cleared too, by elimination the cause must
+   be Part 2a's hardware crop -- most likely `statAreaStatic`'s ROI (`isp_param_conf_imx219.h`:
+   X0=16,Y0=16,XSize=320,YSize=240) sampling a different physical region than intended, since
+   `ISP_SVC_ISP_SetStatArea()` (`Appli/ISP_MW/isp/Src/isp_services.c:689`) programs this ROI onto
+   DCMIPP_PIPE1's own hardware statistic-extraction block (`HAL_DCMIPP_PIPE_SetISPAreaStatisticExtractionConfig`)
+   -- the SAME pipe Part 2a's crop was added to. Whether that hardware stat-extraction tap sits
+   before or after the crop stage inside PIPE1 is not yet confirmed from source; if after, Part
+   2a's VStart=60 crop would shift what the ROI actually samples by 60 rows without any code
+   realizing it.
+
+Build clean, RAM 64.58% (unaffected, debug-gate is logic-only).
+
+**Next steps**: flash and retest with this gate. Report back which of the two outcomes above
+occurred so the next fix can target the right part with confidence, instead of another guess.
+Set `DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH` back to `0` once this test's result is known and acted
+on -- it is a temporary diagnostic, not a keeper.
+
+**Result (confirmed by user)**: "oke đã ổn" -- flicker resolved with this gate on, EXCEPT for
+~1-2 seconds of residual flicker right at boot/stream-start. This is outcome 1: Part 1's dynamic
+frame-length switching (even with #15's hysteresis debounce) IS the real cause of the sustained
+flicker. Part 2a's hardware crop is cleared -- `statAreaStatic`'s ROI is not the issue. The
+residual boot-time flicker is a separate, much smaller-scope symptom (likely just AEC's normal
+initial convergence transient before it settles, now that the sustained oscillation is gone) --
+not yet investigated, tracked as a follow-up.
+
+**Current state**: `DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH` is left at `1` (Part 1 dynamic frame
+length disabled, fixed ~16fps ceiling) since this is the confirmed-working state. Re-enabling
+Part 1 needs a fundamentally different approach than continuous recompute (original) or
+hysteresis (#15) -- both made AEC's convergence worse -- so it is parked, not abandoned.
+
+---
+
+## 2026-09-28 (#17) — Slew-limit fix (#16) made image measurably darker on real hardware without fixing flicker; reverted it + reverted Part 2c's YUV422 hardware pipeline as an isolation test
+
+**Symptom after flashing #16**: user reports the image is now noticeably darker than before AND
+still flickers (two screenshots: dim, low-contrast, grayish). This is a real regression -- #16's
+slew-limiting logic itself is confirmed WRONG or at least net-harmful, not just insufficient.
+
+**Why #16 likely backfired**: most plausible explanation is that AEC's own desired target keeps
+swinging between the two extremes FASTER than the chosen ramp (`GAIN_SLEW_MAX_STEP=24`,
+`EXPOSURE_SLEW_MAX_STEP=400` per call) could track -- so instead of converging, `isp_gain`
+perpetually wobbles in a low-to-mid band that is too dark for the actual scene, while still
+showing visible wobble (residual flicker). This means #16's underlying theory (pure actuator-side
+limit-cycling from sitting at the analog-gain saturation boundary) is, at best, an incomplete
+explanation -- slew-limiting the actuator cannot fix a setpoint that itself is being computed
+from something more fundamentally wrong. Per this project's own lesson (do not conclude root
+cause from log analysis alone without hardware confirmation, and diff against the last known-good
+state rather than stacking new theories on unconfirmed ones): reverted #16's slew-limiting in
+`SetSensorGainHelper()`/`SetSensorExposureHelper()` back to direct assignment (kept #15's frame-
+length hysteresis, which is not implicated by this regression).
+
+**New suspect, chosen for isolation testing**: Part 2c (the DCMIPP hardware YUV422 color-
+conversion pipeline, introduced in the SAME round as Part 1's dynamic frame length -- i.e. the
+flicker was never observed with Part 2c absent, only ever after both landed together). That
+block's own comment asserted the AEC statistics tap (`stats.down`) sits upstream of the YUV-
+conversion/pixel-packer stage, so it "should be" unaffected -- but Bug 23 already proved once
+that this kind of "should be independent" assumption about this pipeline can be wrong, and it was
+never actually verified on hardware in isolation (Part 1 and Part 2 were flashed and tested
+together, skipping the plan's own recommended per-part isolation testing).
+
+**Change** (isolation test, not a confirmed fix):
+- `Appli/Core/Src/main.c` (`MX_DCMIPP_Init()`): reverted `PixelPackerFormat` back to
+  `DCMIPP_PIXEL_PACKER_FORMAT_RGB565_1`; removed the `HAL_DCMIPP_PIPE_SetYUVConversionConfig()` /
+  `HAL_DCMIPP_PIPE_EnableYUVConversion()` calls entirely.
+- `Appli/Core/Src/app_threadx.c`: `jpg_conf.fmt_src` reverted `JPG_SRC_YUV422` -> `JPG_SRC_RGB565`
+  (back to the software `CVT_FormatRgb565ToYuv422Jpeg()` path, ~18-20ms/frame instead of ~5ms --
+  a real CPU cost, accepted temporarily for debugging).
+- Part 2a (hardware crop to 640x360) and Part 2b (USBX pool shrink) are UNCHANGED and NOT part of
+  this isolation test -- they don't touch the pixel/statistics path the way 2c does.
+- Build: RAM 64.59% (was 64.64% with #16's slew code; mcu_buffer is unaffected by source format
+  either way, so no meaningful RAM change expected or seen).
+
+**Next steps**: flash and retest. Two outcomes:
+1. Flicker/darkness resolves with 2c reverted -> Part 2c's hardware YUV-conversion stage IS
+   disturbing AEC/AWB metering despite the "upstream, should be independent" assumption; do not
+   re-apply it without first finding out why (candidate: the BT.601 matrix coefficients affecting
+   whatever the stats block actually taps, or a timing/latency change from the extra pipeline
+   stage). FPS/CPU win from Part 2c would need to wait until that's understood.
+2. Flicker/darkness persists identically with 2c reverted -> rules out 2c entirely; the
+   instability is really in the frame-length dynamics (Part 1) or gain-saturation/metering theory
+   from #15/#16, or possibly `statAreaStatic`'s ROI (`isp_param_conf_imx219.h`: X0=16,Y0=16,
+   XSize=320,YSize=240) now sampling a different physical region than intended after Part 2a's
+   hardware crop shifted PIPE1's coordinate origin -- worth checking whether the ISP statistics
+   block taps before or after the crop stage next.
+
+---
+
+## 2026-09-28 (#16) — Frame-length hysteresis (#15) did not fully fix the flicker; real cause is AEC limit-cycling at the analog-gain ceiling in normal light; fixed with slew-rate limiting on gain/exposure writes (same technique as Raspberry Pi/libcamera's AGC)
+
+**Symptom**: after flashing #15's frame-length hysteresis fix, user still saw flicker in a new
+video + `[UVC_CAP]` log. Crucially, user reported: covering the lens (true darkness) does NOT
+flicker -- image pins stably at max gain/exposure -- but uncovering it (normal room light)
+flickers again.
+
+**Log analysis**: `isp_gain` alternates cleanly between `0` and `232` (the analog-gain ceiling,
+Bug 22) every few AEC updates (roughly every 1-3 seconds), and every single time `isp_gain=232`
+it is paired with `isp_exposure=3522` (the exposure ceiling) with zero exceptions across the
+whole log. When `isp_gain=0`, `isp_exposure` varies (2690-3522) but is often still high. This
+ruled out #15's frame-length coupling as the (sole) cause -- frame length only changes on a
+60-call debounce, far less often than this gain toggling -- and pointed at a genuine AEC
+control-loop instability.
+
+**Root cause**: `ispGainStatic` (`isp_param_conf_imx219.h`, WB-ratio-only since Bug 23:
+R=150000000, G=100000000, B=140000000 in ISP's fixed-point gain units) weights G noticeably
+lower than R/B. `isp_algo.c` confirms AEC's brightness metric is `stats.down.averageL`, measured
+AFTER this gain is applied (not before). Because G carries the largest luma weight, this
+under-weights the metered brightness relative to the true scene -- AEC believes the scene is
+dimmer than it is, so its correct operating point in NORMAL light sits right at/near the
+analog-gain ceiling, not comfortably below it. A closed-loop controller with no slew/rate
+limiting that operates right at a saturation boundary classically limit-cycles: full step to the
+ceiling, overshoot past target once there, full step back down, repeat -- exactly the clean
+0<->232 alternation seen in the log. In TRUE darkness (lens covered) there is no ambiguity --
+max gain/exposure is simply the correct answer -- so it pins stably with no cycling, matching
+what the user observed.
+
+We cannot patch the precompiled AEC (`libn6-evision-st-ae_gcc.a`), so the fix is the same one
+Raspberry Pi/libcamera's AGC uses to avoid this exact failure mode (its "speed" parameter) --
+this is also the concrete answer to the user's earlier question of why the same IMX219 doesn't
+flicker on RPi5: its AGC smooths/slews gain and exposure changes instead of applying the full
+AEC-requested delta in one step.
+
+**Fix** (`Appli/Core/Src/main.c`): in `SetSensorGainHelper()` and `SetSensorExposureHelper()`,
+clamp the per-call change to `isp_gain`/`isp_exposure` to `GAIN_SLEW_MAX_STEP=24` /
+`EXPOSURE_SLEW_MAX_STEP=400` respectively (full range ramps in ~9-10 calls) before writing to
+the sensor. `GetSensorGainHelper()`/`GetSensorExposureHelper()` already read back
+`isp_gain`/`isp_exposure`, which now hold the SLEWED (actually-applied) value rather than the
+raw AEC request -- this is essential: if AEC's internal state tracking believed its full request
+had already landed (when only a fraction did), the clamp would not damp its control loop at all.
+The `Exposure` parameter is overwritten with the slewed value before #15's
+`short_is_enough`/frame-length logic runs, so that logic (unchanged) now hysteresis-switches
+based on the smoothed exposure trajectory, not the raw AEC request.
+
+**Next steps**: flash and re-check the video for flicker. Expect gain/exposure to ramp smoothly
+over roughly half a second instead of jumping instantly between extremes -- real exposure
+changes (e.g. turning off a light) should still be visible within ~1s, just smoothed, not
+snapped. If flicker is reduced but not fully gone, `GAIN_SLEW_MAX_STEP`/`EXPOSURE_SLEW_MAX_STEP`
+can be lowered further (slower ramp, more damping) at the cost of slower real response to
+lighting changes. If flicker persists completely unchanged, log `buf_idx` alongside
+`isp_gain`/`isp_exposure` next, per #15's own fallback note, to rule out the Part 2c YUV422
+hardware pipeline / double-buffer asymmetry as a contributing factor instead.
+
+---
+
+## 2026-09-28 (#15) — Dynamic frame length (Part 1) caused AEC to oscillate (visible as flickering brightness in a user-recorded video); fixed with a coarse 2-state switch + shrink debounce instead of continuous recomputation
+
+**Symptom**: after flashing the Part 1/2 changes, the user recorded a video showing visible
+brightness flickering, and the log confirmed it precisely: `isp_gain`/`isp_exposure` alternated
+**every single ~1s poll** between a mid-range value (`gain=0, exposure~2259-2378`, naturally
+varying a little) and the hard ceiling (`gain=232, exposure=3522`, byte-identical every time) --
+a clean 2-state limit cycle, not normal AEC dithering. `[UVC_CAP] fps` alternated 17/18-19 in
+lockstep, confirming the sensor's actual `FRM_LENGTH_LINES` was flipping between two different
+values in sync with the exposure oscillation.
+
+**Root cause**: the first version of `SetSensorExposureHelper()` recomputed `needed_frame_length
+= Exposure + 4` and wrote it on *every single call*, in whichever direction changed. Before this
+session's Part 1, AEC was confirmed *stable* in dark conditions (held `gain=232`/`exposure=3522`
+steady across dozens of consecutive polls, no oscillation) -- introducing a `FRM_LENGTH_LINES`
+write into the same loop AEC's own convergence depends on is what broke that stability. Most
+likely mechanism: a frame-length change takes at least one frame to fully settle the sensor's
+internal timing, and `evision`'s AEC (a precompiled library, its control-loop internals not
+inspectable) evidently assumes only exposure/gain change between its own updates -- an
+unannounced frame-length change on top violates that assumption and made its simple control loop
+overshoot in both directions instead of converging.
+
+**Fix**: replaced the continuously-recomputed frame length with a coarse 2-state switch
+(`SetSensorExposureHelper()`, `main.c`):
+- Only ever `IMX219_FRAME_LENGTH_SHORT` (1763) or `IMX219_FRAME_LENGTH_LONG_MAX` (3526) -- never
+  an intermediate value tied to the exact current exposure. Switching UP still happens
+  immediately when exposure needs more room than SHORT allows (correctness requires this -- can't
+  delay without risking a genuinely underexposed frame), but always to the single LONG_MAX value,
+  so growing itself cannot oscillate between two different "long" values the way the original
+  version did.
+- Switching back DOWN to SHORT only happens after exposure has comfortably fit SHORT (with a
+  100-line margin) for `FRAME_LENGTH_SHRINK_DEBOUNCE` (60) consecutive calls in a row -- a
+  deliberate debounce so a single low reading during normal AEC dithering can't immediately yank
+  the frame length back down, giving AEC's own loop time to actually settle between the rare
+  frame-length transitions that do happen.
+- This is exactly the hysteresis the original plan anticipated might be needed ("KHÔNG thêm
+  hysteresis ở lần đầu... chỉ thêm nếu quan sát thấy FPS/exposure nhấp nháy") -- now confirmed
+  necessary by the observed oscillation, not added speculatively.
+
+**Also fixed in the same pass**: `GetSensorInfoHelper()`'s `Info->width/height` still said
+640x480 -- stale from before Part 2a's hardware crop (main.c's `MX_DCMIPP_Init()` now crops PIPE1
+to 640x360 directly). Updated to 640x360 for consistency; not confirmed to be related to the
+oscillation, but a real inconsistency worth closing while in this function.
+
+Rebuilt clean (64.63% RAM, unchanged -- logic-only change, no new static allocation). **Not yet
+tested on real hardware as of this entry.**
+
+### Next steps
+
+1. **Flash and re-check for flicker** -- both visually and via consecutive `isp_gain=.../
+   isp_exposure=...` log lines. Expect long, stable runs at a single value (like the pre-Part-1
+   dark-room logs), with at most an occasional deliberate SHORT<->LONG_MAX transition when
+   lighting genuinely changes, not per-poll alternation.
+2. **If oscillation persists even with this fix**: that would point away from the frame-length
+   coupling theory and toward something else introduced in the same batch of changes -- most
+   likely the Part 2c YUV-conversion/crop hardware pipeline somehow producing a real
+   frame-to-frame brightness difference AEC is correctly reacting to (e.g. an asymmetry between
+   the two ping-pong buffers). Next diagnostic in that case: log which `buf_idx`
+   (`VIDEO_GetReadyBufferIdx()`) corresponds to which `isp_gain`/`isp_exposure` reading, to check
+   whether the oscillation correlates with which physical buffer was just captured.
+3. If shrink debounce (60 calls, roughly ~1-2s depending on actual fps) feels too slow/fast once
+   seen on real hardware, it's a single `#define` (`FRAME_LENGTH_SHRINK_DEBOUNCE`) to tune -- not
+   a structural change.
+
+---
+
+## 2026-09-28 (latest #14) — Post-Bug-23 architecture work: dynamic frame length (restores ~31fps in bright light) + RAM optimization via DCMIPP hardware crop and right-sized USBX pool (74.23% -> 64.63%) + JPEG pipeline switched to DCMIPP's own hardware YUV conversion
+
+**User pushed back on treating the FPS drop as an unavoidable exposure-headroom tradeoff**: this
+same IMX219 module runs fine on Raspberry Pi without this cost. Correct observation -- RPi's
+driver (like any real camera ISP) uses **dynamic frame length**: it only stretches
+`FRM_LENGTH_LINES` (and pays the FPS cost) when a scene actually needs a longer exposure than the
+fast default allows, then shrinks back down once it doesn't. This project's Bug 18/21 fix instead
+pinned `FRM_LENGTH_LINES` at the long value (3526) *permanently*, paying the ~16fps cost even in
+bright light where `isp_exposure=1` -- confirmed directly in this session's own logs. Planned and
+implemented (plan file: `~/.claude/plans/robust-beaming-pine.md`) this fix plus two RAM
+optimizations and a JPEG pipeline change, approved by the user before implementation.
+
+### Part 1 — Dynamic frame length
+
+- `imx219.h`: added `IMX219_FRAME_LENGTH_SHORT` (1763, confirmed ~31fps on this hardware) and
+  `IMX219_FRAME_LENGTH_LONG_MAX` (3526, confirmed ~16fps, the low-light ceiling), and
+  `IMX219_SetFrameLength()` declaration.
+- `imx219.c`: added `IMX219_SetFrameLength()` (same pattern as `IMX219_SetExposure()`). Changed
+  `imx219_common_regs`'s init table to boot at the SHORT value (was long, from Bug 18) --
+  the sensor should start fast and only slow down when AEC actually needs it. **Also removed a
+  second, redundant frame-length write** (`IMX219_Configure640x480()`'s old "step 4", which used
+  to independently duplicate this same register -- exactly the kind of duplicate-source-of-truth
+  bug Bug 21 already found once this session; better to delete the second copy than keep both in
+  sync by hand going forward).
+- `main.c`: added `static uint16_t current_frame_length` (tracks what the sensor is actually
+  running at). `SetSensorExposureHelper()` now computes `needed = max(SHORT, Exposure + 4)` and
+  grows `FRM_LENGTH_LINES` (via `IMX219_SetFrameLength()`) *before* writing a longer exposure, or
+  shrinks it *after* writing a shorter one -- never leaving the sensor in a state where
+  `COARSE_INTEGRATION_TIME > FRM_LENGTH_LINES`. `GetSensorInfoHelper()`'s `exposure_max` stays at
+  the long ceiling (3522) unchanged -- AEC can still ask for a long exposure any time, the frame
+  length just grows to match instead of being fixed there always.
+
+### Part 2 — RAM optimization (no resolution change, per user's explicit choice)
+
+**2a. DCMIPP hardware crop** (`main.c`'s `MX_DCMIPP_Init()`): added
+`HAL_DCMIPP_PIPE_SetCropConfig()` + `EnableCrop()` for PIPE1 (`VStart=60, HStart=0, VSize=360,
+HSize=640`) -- DCMIPP now captures only the 640x360 region actually streamed, instead of the full
+640x480 that `ux_device_video.c` immediately discarded 120 rows of via a manual `+60*640*2`
+pointer offset. That offset is now removed (the buffer already IS the cropped region).
+`FRAME_HEIGHT` (`main.c`) and `VIDEO_BUF_HEIGHT` (`app_threadx.c`) both changed 480 -> 360 to
+match. **Measured: `video_buf1` 614400B -> 460800B, RAM 74.23% -> 66.97%** (~150KB freed, matches
+the plan's estimate almost exactly).
+
+**2b. Right-sized USBX memory pool** (`app_azure_rtos_config.h`): `UX_APP_MEM_POOL_SIZE` 192KB ->
+144KB. Verified by reading the code first (not guessed): the only two allocations ever drawn from
+`ux_app_byte_pool` are `USBX_MEMORY_STACK_SIZE` (128KB, `app_usbx.h`) and
+`UX_DEVICE_APP_THREAD_STACK_SIZE` (4KB, `app_usbx_device.h`) = 132KB real usage against a 192KB
+backing array. **Measured: RAM 66.97% -> 64.63%** (~48KB freed, matches estimate).
+
+**Combined**: RAM usage **74.23% -> 64.63%**, ~197KB freed, with the streamed resolution
+unchanged (640x360) -- banked for future use rather than spent on resolution now, per the user's
+explicit choice when this was planned.
+
+### Part 2c — JPEG pipeline switched to DCMIPP's own hardware YUV conversion (CPU/FPS, not RAM)
+
+Corrected an overstated claim from the entry before Bug 23: this does NOT eliminate `mcu_buffer`
+(the JPEG HW encoder needs MCU-block-ordered input regardless of source pixel format, so a staging
+buffer is unavoidable either way). What it actually saves is CPU time: the log's own `cvt=`
+timing showed ~18-20ms/frame for the software `RGB565 -> YUV422 + MCU-block` conversion
+(`CVT_FormatRgb565ToYuv422Jpeg`/`CVT_CvtRgb565ToMcu422` in `app_cvt.c`) versus ~5ms for the actual
+hardware JPEG encode (`HAL_JPEG_Encode`) -- the software conversion was 75-80% of total per-frame
+time. `CVT_CvtYuv422ToMcu422` (used when the source is already YUV422) does pure byte reordering,
+no per-pixel color math -- confirmed by reading `app_cvt.c` directly, not assumed.
+
+- `main.c` (`MX_DCMIPP_Init()`): added `HAL_DCMIPP_PIPE_SetYUVConversionConfig()` +
+  `EnableYUVConversion()` for PIPE1, using `../Camera_N6_AI_Test`'s confirmed-working BT.601
+  matrix coefficients verbatim. Changed `pPipeConfig.PixelPackerFormat` from
+  `DCMIPP_PIXEL_PACKER_FORMAT_RGB565_1` to `..._YUV422_1`. Ordering matters and was followed
+  exactly per the reference project's own comment: `SetConfig()` (packer) first, then
+  `EnableYUVConversion()` after -- `SetConfig()` resets the P1CCCR register the YUV block also
+  uses.
+- `app_threadx.c`: `JPG_Init()`'s `fmt_src` changed from `JPG_SRC_RGB565` to `JPG_SRC_YUV422` --
+  the cheaper path already existed in `app_jpg.c`/`app_cvt.c`, just wasn't wired up.
+- **Explicitly flagged as needing hardware verification, not assumed safe**: the YUV-conversion
+  block sits downstream of ISP_MW/evision's demosaic/AWB/AE stages and its own statistics tap
+  (`stats.down`, see Bug 23), so it *should* be invisible to AEC/AWB convergence -- but Bug 23 was
+  exactly this kind of "should be independent, wasn't" surprise, so this must be confirmed with
+  real `isp_gain=.../isp_exposure=...` numbers on hardware, not assumed correct because the theory
+  sounds right.
+
+Rebuilt clean after every sub-step (main.c, app_threadx.c, imx219.c, ux_device_video.c,
+app_azure_rtos_config.h) -- final combined build: **64.63% RAM**, no errors (pre-existing
+`%u`/`ULONG` printf format warnings in `app_usbx_device.c` are unrelated pre-existing noise, not
+new). **Not yet tested on real hardware as of this entry** -- this is a substantial, multi-part
+change; testing each part somewhat independently (per the plan's verification section) is
+important before trusting all of it at once.
+
+### Next steps
+
+1. **Flash and test Part 1 first conceptually** even though all parts are in one build: bright
+   room should show `isp_exposure` low and FPS back near ~30; a genuinely dark room should show
+   FPS drop to ~16 only then, not always.
+2. **Confirm Part 2a's crop is correct**: image should show the same 640x360 field of view as
+   before (no vertical shift/stretch), not a different crop position.
+3. **Confirm Part 2c didn't disturb AEC/AWB**: read `isp_gain=.../isp_exposure=...` across both
+   lighting conditions again -- should still converge to sensible values, not pin at either
+   extreme the way Bug 22/23 did.
+4. Compare `[JPG] enc=...cvt=...hal=...` before/after -- `cvt` should have dropped substantially.
+5. If frame length oscillates visibly (FPS flickering) when a scene is borderline: revisit the
+   plan's noted possibility of adding hysteresis to the grow/shrink logic in
+   `SetSensorExposureHelper()` -- deliberately not added on the first pass to keep the initial
+   implementation simple and correct.
+
+---
+
 ## 2026-09-28 (latest #13) — Bug 23: Bug 22's digital gain boost was WRONG and made things worse -- it lies to AEC's own brightness metering, since AEC measures luminance on data the boost has already been applied to; reverted to plain white-balance-only gains
 
 **Tested Bug 22's fix under bright room lighting (user's own next step from that entry, done

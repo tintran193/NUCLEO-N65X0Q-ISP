@@ -27,9 +27,10 @@
   *   That region is only touched by main.c's pre-RTOS single-shot
   *   verification, which has already completed and stopped PIPE1 by the
   *   time this thread runs -- reusing it instead of allocating a fresh
-  *   614400-byte buffer saves 600KB, which the RTOS+USB+JPEG image needs.
-  *   video_buf[1] is a newly allocated static RGB565 buffer of the same
-  *   size (640x480x2 = 614400 bytes).
+  *   buffer saves real RAM, which the RTOS+USB+JPEG image needs.
+  *   video_buf[1] is a newly allocated static buffer of the same size
+  *   (640x360x2 = 460800 bytes as of the post-Bug-23 hardware-crop change;
+  *   was 640x480x2 = 614400 bytes before).
   *
   * DCache policy: mirrors the exact mechanism already confirmed working in
   * this project's own main.c single-shot path (SCB_InvalidateDCache_by_Addr
@@ -83,9 +84,16 @@ extern IMX219_CTX_t         imx219_ctx;
  * comment above -- reused here as video_buf[0] to save 600KB of RAM). */
 extern uint8_t *camera_framebuffer;
 
+/* RAM optimization (see WORKLOG.md, post-Bug-23 plan): height changed from
+ * 480 to 360 -- DCMIPP now hardware-crops PIPE1 to the 640x360 region
+ * actually streamed (main.c's MX_DCMIPP_Init()), so these buffers no longer
+ * need to hold the discarded top/bottom 120 rows. Shrinks video_buf1 from
+ * 614400B to 460800B (153600B freed). Pixel format is now YUV422 (post-Bug-23
+ * hardware color-conversion switch), still 2 bytes/pixel like RGB565 was, so
+ * VIDEO_BUF_SIZE's byte math is unchanged. */
 #define VIDEO_BUF_WIDTH  640U
-#define VIDEO_BUF_HEIGHT 480U
-#define VIDEO_BUF_SIZE   (VIDEO_BUF_WIDTH * VIDEO_BUF_HEIGHT * 2U)  /* RGB565, 2 B/px */
+#define VIDEO_BUF_HEIGHT 360U
+#define VIDEO_BUF_SIZE   (VIDEO_BUF_WIDTH * VIDEO_BUF_HEIGHT * 2U)  /* YUV422, 2 B/px */
 
 /*
  * Bug 14 (see WORKLOG.md) -- the real double-buffering design, after two
@@ -240,15 +248,21 @@ static void CaptureUVC_Thread(ULONG arg)
     video_buf[0] = camera_framebuffer;
     video_buf[1] = video_buf1;
 
-    /* ---- JPEG init: RGB565 source (this project's real ISP output),
-     * NOT JPG_SRC_YUV422 like Camera_N6_AI_Test -- that is exactly the
-     * hand-tuned-color path this project is deliberately avoiding.
-     * Encode resolution 640x360 (see crop note in ux_device_video.c). */
-    JPG_conf_t jpg_conf = { .width = 640, .height = 360, .fmt_src = JPG_SRC_RGB565 };
+    /* ---- JPEG init: YUV422 source, RESTORED (see WORKLOG.md #21). #17 had
+     * reverted this to RGB565 to test 2c in isolation, but that test was
+     * confounded by Part 1's still-active dynamic frame length (the real
+     * cause, fixed in #18); restoring now that #21 found the remaining
+     * oscillation correlates with JPG_Encode()'s per-frame CPU/bus busy
+     * time, which this hardware path cuts from ~18-22ms (software
+     * CVT_FormatRgb565ToYuv422Jpeg) down to near the ~5ms HW JPEG core floor
+     * (CVT_FormatYuv422ToYuv422Jpeg is pure byte reordering, no RGB->YUV
+     * math). Encode resolution 640x360 -- DCMIPP hardware-crops PIPE1 to
+     * this directly, see main.c's MX_DCMIPP_Init(). */
+    JPG_conf_t jpg_conf = { .width = 640, .height = 360, .fmt_src = JPG_SRC_YUV422 };
     if (JPG_Init(&jpg_conf) != 0)
         printf("[ERROR] JPG_Init failed\r\n");
     else
-        printf("[OK]    JPEG encoder initialized (640x360 RGB565->YUV422 Q70)\r\n");
+        printf("[OK]    JPEG encoder initialized (640x360 YUV422 hardware pipeline Q70)\r\n");
 
     /*
      * Bug 9 (see WORKLOG.md): HAL_DCMIPP_CSI_PIPE_Start()'s internal
@@ -287,6 +301,52 @@ static void CaptureUVC_Thread(ULONG arg)
         printf("[OK]    DCMIPP PIPE1 continuous capture started (buf[0]=0x%08lX buf[1]=0x%08lX)\r\n",
                (unsigned long)(uint32_t)video_buf[0],
                (unsigned long)(uint32_t)video_buf[1]);
+    }
+
+    /* AEC settle delay, take 2 (see WORKLOG.md #19/#20): a fixed 1.5s guess
+     * was not enough for a dark/high-contrast test scene (ceiling + bare
+     * light tube) -- the hardware log showed isp_gain still at 0 (not yet
+     * ramped to the 232 ceiling this scene needs) by the time USB actually
+     * started transmitting, so the viewer still saw the gain=0->232 ramp
+     * live. A fixed duration can't be right for every scene: how many AEC
+     * iterations it takes to reach the correct operating point depends on
+     * how far from default (isp_gain=0, isp_exposure=1600, main.c) the real
+     * room's target is. Wait for actual convergence instead of guessing a
+     * duration -- stop once isp_gain/isp_exposure have both held steady for
+     * a run of consecutive pumps (ordinary AEC dither is far smaller and
+     * faster than a boot ramp, so a short steady run is a reliable signal),
+     * with a hard timeout so a scene that never truly settles (e.g. a
+     * flickering light source) cannot delay stream start forever. */
+    extern int32_t isp_gain, isp_exposure;
+#define AEC_SETTLE_STEP_MS      20U
+#define AEC_SETTLE_STABLE_STEPS 20U   /* ~400ms unchanged before declaring convergence */
+#define AEC_SETTLE_TIMEOUT_MS   4000U /* give up and stream anyway past this */
+    {
+        int32_t  last_gain = isp_gain, last_exposure = isp_exposure;
+        uint32_t stable_steps = 0U;
+        uint32_t elapsed_ms = 0U;
+
+        while ((stable_steps < AEC_SETTLE_STABLE_STEPS) && (elapsed_ms < AEC_SETTLE_TIMEOUT_MS))
+        {
+            ISP_BackgroundProcess(&hcamera_isp);
+            tx_thread_sleep(AEC_SETTLE_STEP_MS);
+            elapsed_ms += AEC_SETTLE_STEP_MS;
+
+            if ((isp_gain == last_gain) && (isp_exposure == last_exposure))
+            {
+                stable_steps++;
+            }
+            else
+            {
+                stable_steps = 0U;
+                last_gain = isp_gain;
+                last_exposure = isp_exposure;
+            }
+        }
+
+        printf("[UVC_CAP] AEC settle: %lums, gain=%ld exposure=%ld%s\r\n",
+               (unsigned long)elapsed_ms, (long)isp_gain, (long)isp_exposure,
+               (stable_steps >= AEC_SETTLE_STABLE_STEPS) ? "" : " (timed out)");
     }
 
     /* From here on, main.c's HAL_DCMIPP_PIPE_FrameEventCallback forwards

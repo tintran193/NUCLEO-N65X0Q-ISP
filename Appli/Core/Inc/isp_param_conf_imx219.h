@@ -50,10 +50,52 @@ static const ISP_IQParamTypeDef ISP_IQParamCacheInit_IMX219 = {
      * a static, uncalibrated placeholder for white balance in the
      * meantime, not a substitute for real AWB tuning.
      */
+    /*
+     * Bright-highlight hunting fix, see WORKLOG.md #23: user confirmed via a
+     * controlled test that isp_gain/isp_exposure only oscillate when the
+     * camera is pointed at a genuinely bright area (window/light/outdoors --
+     * confirmed a real intended use case, not just a stress test) and sit
+     * rock-stable otherwise (450+ consecutive frames pinned exactly, no
+     * drift, when not pointed at bright content) -- this ruled out every
+     * earlier USB/JPEG-encode/frame-length theory from this session. This
+     * is the classic failure mode of simple average-luma metering cameras
+     * pointed at a partially-saturated highlight: isp_gain/isp_exposure
+     * start pinned at the ceiling (correct for this room's normal light),
+     * and when a bright highlight enters frame the AEC needs a big, fast
+     * cut -- with statAreaStatic's window (below) still centered on default
+     * and 0.0 EV target sitting the steady-state operating point right at
+     * the hard gain/exposure ceiling (see #16's writeup on why sitting at a
+     * saturation boundary is a bad place for any control loop), a big
+     * demanded correction from right at that boundary is exactly where
+     * overshoot/hunting shows up. ISP_AECAlgoTypeDef (checked directly,
+     * isp_core.h) exposes no damping/speed/hysteresis knob at all -- only
+     * enable/exposureCompensation/antiFlickerFreq -- so exposureCompensation
+     * is the one legitimate, vendor-provided lever available here (as
+     * opposed to this session's earlier app-level hacks -- frame-length
+     * coupling, slew-limiting -- fighting the closed-source AEC from
+     * outside). Lowering the target moves normal-light steady-state away
+     * from the ceiling and shrinks how large a cut is needed when a
+     * highlight appears. antiFlickerFreq=50 (Vietnam mains) costs nothing
+     * and is simply correct for indoor AC-powered lighting (a window's room
+     * light, an LED/fluorescent lamp) -- enabling it regardless of whether
+     * it's the primary cause here.
+     *
+     * -1.0 EV (first try, #23) overshot badly: hunting gone (rock-steady)
+     * but pinned at the absolute floor (gain=0, exposure=1), fully black in
+     * EVERY condition, not just bright scenes. -0.5 EV (#24) was still too
+     * dark. See WORKLOG.md #25: exposureCompensation is a GLOBAL, uniform
+     * shift -- it darkens every scene by the same amount, including normal
+     * rooms that were never the problem, so there is no single EV value
+     * that fixes the bright-highlight case without also breaking normal-
+     * light visibility. Reverted to 0.0 EV; the real fix needs to target
+     * the metering window itself (statAreaStatic), not a blanket exposure
+     * shift -- parked pending more info on where bright sources typically
+     * sit in frame for this camera's real mounting.
+     */
     .AECAlgo = {
         .enable = 1,
         .exposureCompensation = EXPOSURE_TARGET_0_0_EV,
-        .antiFlickerFreq = 0,
+        .antiFlickerFreq = ANTIFLICKER_50HZ,
     },
     .statRemoval = {
         .enable = 0,

@@ -43,8 +43,14 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+/* RAM optimization (see WORKLOG.md, post-Bug-23 plan): FRAME_HEIGHT changed
+ * from 480 to 360 to match PIPE1's new hardware crop (MX_DCMIPP_Init()) --
+ * DCMIPP now only ever captures/writes the 360-row region actually streamed,
+ * both here (single-shot verification, camera_framebuffer) and in the
+ * continuous UVC pipeline (app_threadx.c's video_buf[0], which IS
+ * camera_framebuffer -- see its own comment on why they're the same buffer). */
 #define FRAME_WIDTH       640U
-#define FRAME_HEIGHT      480U
+#define FRAME_HEIGHT      360U
 #define FRAME_BPP         2U
 
 #define FRAME_BUFFER_SIZE  (FRAME_WIDTH * FRAME_HEIGHT * FRAME_BPP)
@@ -83,6 +89,14 @@ IMX219_CTX_t imx219_ctx;
  * real numbers instead of guessing further. */
 int32_t isp_gain = 0;
 int32_t isp_exposure = 1600;
+
+/* Post-Bug-23 FPS work (see WORKLOG.md): tracks what FRM_LENGTH_LINES the
+ * sensor is actually running at right now, so SetSensorExposureHelper() can
+ * grow it only when needed and shrink it back down otherwise, instead of
+ * the old approach of permanently fixing it at the long (low-fps) value.
+ * Must start at IMX219_FRAME_LENGTH_SHORT -- imx219_common_regs's init
+ * table (imx219.c) boots the sensor at exactly that value. */
+static uint16_t current_frame_length = IMX219_FRAME_LENGTH_SHORT;
 
 //__attribute__((aligned(32)))
 //static uint8_t camera_framebuffer[FRAME_BUFFER_SIZE];
@@ -931,10 +945,73 @@ static void MX_DCMIPP_Init(void)
   pCSI_Config.DataLaneMapping = DCMIPP_CSI_PHYSICAL_DATA_LANES;
   pCSI_Config.NumberOfLanes = DCMIPP_CSI_TWO_DATA_LANES;
   HAL_DCMIPP_CSI_SetConfig(&hdcmipp, &pCSI_Config);
+
+  /* RAM optimization (see WORKLOG.md, post-Bug-23 plan): the UVC stream has
+   * always cropped 640x480 down to a centered 640x360 in SOFTWARE
+   * (ux_device_video.c reading VIDEO_GetReadyBuffer() + 60*640*2), after
+   * DCMIPP already captured and stored the full 640x480 -- wasting 120 rows
+   * (76800 px) of capture buffer that's immediately discarded. Crop in
+   * hardware instead, so DCMIPP only ever writes/stores the 640x360 region
+   * actually used: shrinks video_buf1 (app_threadx.c) from 614400B to
+   * 460800B, freeing 153600B. FRAME_HEIGHT/FRAME_BUFFER_SIZE below and
+   * VIDEO_BUF_HEIGHT (app_threadx.c) must match this 360, and
+   * ux_device_video.c's manual "+60*640*2" row-skip is removed since the
+   * skip now happens in hardware. */
+  DCMIPP_CropConfTypeDef pCropConfig = {0};
+  pCropConfig.VStart   = 60U;
+  pCropConfig.HStart   = 0U;
+  pCropConfig.VSize    = 360U;
+  pCropConfig.HSize    = 640U;
+  pCropConfig.PipeArea = DCMIPP_POSITIVE_AREA;
+  if (HAL_DCMIPP_PIPE_SetCropConfig(&hdcmipp, DCMIPP_PIPE1, &pCropConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DCMIPP_PIPE_EnableCrop(&hdcmipp, DCMIPP_PIPE1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   pPipeConfig.FrameRate = DCMIPP_FRAME_RATE_ALL;
-  pPipeConfig.PixelPipePitch = 1280; //640 for RAW8, 1280 for RGB565
-  pPipeConfig.PixelPackerFormat = DCMIPP_PIXEL_PACKER_FORMAT_RGB565_1;
+  pPipeConfig.PixelPipePitch = 1280; //640 for RAW8, 1280 for RGB565/YUV422
+  /* Part 2c, RESTORED (see WORKLOG.md #21): #17 reverted this to RGB565 to
+   * test whether it was corrupting AEC's statistics -- #18 then proved the
+   * real cause was Part 1's dynamic frame length (unrelated to this block),
+   * so that #17 test was confounded and never actually cleared 2c on its
+   * own merits. New evidence (#21): with Part 1 now fully disabled, a fresh
+   * log showed the remaining oscillation correlates exactly with active
+   * JPEG encode+USB activity (isp_gain/isp_exposure perfectly frozen the
+   * instant [UVC] Stream OFF happens, oscillating again the instant
+   * streaming resumes) -- and JPG_Encode()'s software RGB565->YUV422
+   * conversion (ux_device_video.c's fill_uvc_payload(), synchronous inside
+   * the USBX video write thread) was costing ~18-22ms of CPU/bus time per
+   * frame with 2c reverted, vs. ~microseconds when this hardware stage does
+   * the conversion instead (leaving only ~5ms of real HW JPEG core time).
+   * Restoring this to shrink that per-frame busy window and see whether it
+   * reduces/eliminates the still-active-streaming-only oscillation. */
+  pPipeConfig.PixelPackerFormat = DCMIPP_PIXEL_PACKER_FORMAT_YUV422_1;
   if (HAL_DCMIPP_PIPE_SetConfig(&hdcmipp, DCMIPP_PIPE1, &pPipeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* YUV conversion MUST be configured/enabled AFTER HAL_DCMIPP_PIPE_SetConfig()
+   * above -- SetConfig() resets P1CCCR, so enabling YUV conversion before it
+   * would just get wiped (same ordering constraint ../Camera_N6_AI_Test's own
+   * comment documents). Matrix coefficients copied verbatim from that
+   * project's confirmed-working BT.601 full-range RGB->YUV conversion. */
+  DCMIPP_ColorConversionConfTypeDef yuv_cfg = {
+    .ClampOutputSamples = ENABLE,
+    .OutputSamplesType  = DCMIPP_CLAMP_YUV,
+    .RR = 131, .RG = -119, .RB = -12, .RA = 128,
+    .GR =  55, .GG =  183, .GB =  18, .GA =   0,
+    .BR = -30, .BG = -101, .BB = 131, .BA = 128,
+  };
+  if (HAL_DCMIPP_PIPE_SetYUVConversionConfig(&hdcmipp, DCMIPP_PIPE1, &yuv_cfg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DCMIPP_PIPE_EnableYUVConversion(&hdcmipp, DCMIPP_PIPE1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1432,9 +1509,10 @@ static ISP_StatusTypeDef GetSensorInfoHelper(uint32_t Instance,
     Info->bayer_pattern = ISP_DEMOS_TYPE_RGGB;
     Info->color_depth   = 10;
 
-    /* Mode 640x480 */
+    /* Mode 640x360 (post-Bug-23: PIPE1 now hardware-crops to this directly,
+     * see main.c's MX_DCMIPP_Init() -- was 640x480 before). */
     Info->width  = 640;
-    Info->height = 480;
+    Info->height = 360;
 
     /* Bug 22 (see WORKLOG.md): 255 is past the IMX219's own documented
      * analog gain ceiling -- ../Camera_N6_AI_Test's comment on this same
@@ -1462,11 +1540,76 @@ static ISP_StatusTypeDef GetSensorInfoHelper(uint32_t Instance,
     return ISP_OK;
 }
 
+/* Post-Bug-23 FPS work, oscillation follow-up #2 (see WORKLOG.md): even
+ * with the frame-length hysteresis fix below, a hardware log in normal
+ * room light still shows isp_gain flipping cleanly between 0 and the 232
+ * ceiling (isp_exposure riding to/from the 3522 ceiling with it) every
+ * few AEC updates -- visible as flicker. Covering the lens (true
+ * darkness) does NOT flicker, it pins stably at the ceiling -- there is
+ * exactly one correct answer and no ambiguity. In normal light there
+ * isn't: ispGainStatic's WB ratios (isp_param_conf_imx219.h) weight G
+ * noticeably lower than R/B, and stats.down.averageL -- what AEC actually
+ * measures -- is taken AFTER that gain (confirmed in isp_algo.c), so the
+ * metered brightness reads dimmer than the true scene and biases AEC's
+ * correct operating point to sit right at/near the analog-gain ceiling
+ * even in normal light. A closed-loop controller with no slew limiting
+ * can limit-cycle right at a saturation boundary: full step up, overshoot
+ * past target, full step down, repeat -- exactly the clean 0<->232
+ * alternation in the log.
+ *
+ * ATTEMPTED FIX (reverted, see WORKLOG.md #17): slew-limiting isp_gain/
+ * isp_exposure at this boundary, reporting the slewed value back via
+ * Get*Helper. Tested on hardware: image came back noticeably DARKER and
+ * still flickered. Most likely explanation: AEC's own target was moving
+ * between the two extremes FASTER than the chosen ramp could track, so
+ * isp_gain got stuck wobbling in a low-mid band that is too dark for this
+ * scene and never reaches the ceiling this scene actually needs -- i.e.
+ * the actuator-side theory above may still be part of the picture, but
+ * slew-limiting alone does not fix a setpoint that itself hunts, and
+ * guessing a slower/faster step size blind (no hardware access here to
+ * iterate on) is not a sound way to tune it further. Reverted to direct
+ * assignment; see #17 for the current isolation-test direction instead
+ * (reverting Part 2c's YUV422 hardware pipeline to rule it out as the
+ * actual source of bad/noisy AEC statistics, before touching this AEC
+ * theory again). */
+/* Slew-limit retry, see WORKLOG.md #26: #16 tried this and hardware testing
+ * showed the image got stuck too dark, which looked like a failed idea at
+ * the time -- but that test ran while Part 1's dynamic frame length was
+ * STILL live (only disabled two steps later, in #18), which was itself
+ * feeding AEC inconsistent/erratic frame timing. A slew-limited actuator
+ * chasing a target that's ALSO being perturbed by a second, independent bug
+ * can never catch up -- that's the "stuck in a low-mid band" symptom #16
+ * saw, not necessarily a flaw in slew-limiting itself. Now that #18 (Part 1
+ * disabled), #21 (Part 2c restored, encode time not the cause), and #25
+ * (global EV shift proven the wrong lever -- darkens everything uniformly,
+ * can't win) have narrowed this down to a clean, well-understood case
+ * (AEC hunts specifically when a real, external highlight forces a large
+ * fast correction from the gain/exposure ceiling), this is worth retrying
+ * on its own merits: this is literally the technique Raspberry Pi/
+ * libcamera's AGC uses (its "speed" parameter) for exactly this failure
+ * mode. Get*Helper below reports back the SLEWED value actually applied,
+ * not the raw AEC request -- required so AEC's own internal state tracking
+ * doesn't desync from real hardware state, or the clamp doesn't damp
+ * anything (same requirement #16 already established). */
+#define GAIN_SLEW_MAX_STEP       24    /* 0->232 ceiling in ~10 calls */
+#define EXPOSURE_SLEW_MAX_STEP   400   /* full range in ~9 calls */
+
 static ISP_StatusTypeDef SetSensorGainHelper(uint32_t Instance, int32_t Gain)
 {
   UNUSED(Instance);
-  isp_gain = Gain;
-  return (ISP_StatusTypeDef) IMX219_SetGain(&imx219_ctx,Gain);
+  int32_t delta = Gain - isp_gain;
+
+  if (delta > GAIN_SLEW_MAX_STEP)
+  {
+      delta = GAIN_SLEW_MAX_STEP;
+  }
+  else if (delta < -GAIN_SLEW_MAX_STEP)
+  {
+      delta = -GAIN_SLEW_MAX_STEP;
+  }
+  isp_gain += delta;
+
+  return (ISP_StatusTypeDef) IMX219_SetGain(&imx219_ctx, (uint8_t)isp_gain);
 }
 
 static ISP_StatusTypeDef GetSensorGainHelper(uint32_t Instance, int32_t *Gain)
@@ -1476,11 +1619,125 @@ static ISP_StatusTypeDef GetSensorGainHelper(uint32_t Instance, int32_t *Gain)
   return ISP_OK;
 }
 
+/* Post-Bug-23 FPS work, hysteresis follow-up (see WORKLOG.md): the first
+ * version of this function recomputed `needed_frame_length` as
+ * `Exposure + 4` on every single call and wrote it immediately in either
+ * direction. Confirmed on hardware this made AEC's own convergence
+ * unstable -- isp_gain/isp_exposure oscillated every single ~1s poll
+ * between a mid-range value (gain=0, exposure~2300) and the hard ceiling
+ * (gain=232, exposure=3522), visible on camera as flickering brightness.
+ * AEC was stable (held a single steady value) before dynamic frame length
+ * was introduced, so the frame-length write itself -- not AEC in
+ * isolation -- is what's perturbing convergence (most likely: a
+ * FRM_LENGTH_LINES change takes a frame or more to fully settle the
+ * sensor's internal timing, and AEC's simple control loop wasn't designed
+ * to expect anything but exposure/gain changing between its own updates).
+ *
+ * Fixed by making this a coarse 2-state switch instead of a continuously
+ * recomputed value: only ever SHORT or LONG_MAX, never an intermediate
+ * length, and only switch DOWN after exposure has stayed comfortably low
+ * for many consecutive calls in a row (debounced) -- switching UP still
+ * happens immediately since under-exposing while debouncing would be
+ * visibly wrong, but switching UP is also only ever to the single LONG_MAX
+ * value, never a finely-tuned intermediate, so it cannot itself oscillate
+ * between two long values the way the original version did. */
+#define FRAME_LENGTH_SHRINK_MARGIN     100U  /* stay well clear of the SHORT ceiling */
+#define FRAME_LENGTH_SHRINK_DEBOUNCE   60U   /* consecutive calls before shrinking back */
+
+/* Isolation test toggle, see WORKLOG.md #18 -- flip to 0 to restore Part 1's
+ * dynamic frame-length switching once this test's result is known. */
+#define DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH 1
+
 static ISP_StatusTypeDef SetSensorExposureHelper(uint32_t Instance, int32_t Exposure)
 {
   UNUSED(Instance);
-  isp_exposure = Exposure;
-  return (ISP_StatusTypeDef) IMX219_SetExposure(&imx219_ctx, Exposure);
+
+#if DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH
+  /* Isolation test (see WORKLOG.md #18): Part 2c is now ruled out (reverted
+   * in #17, flicker/darkness identical) -- this gate removes Part 1's
+   * dynamic frame-length switching entirely, pinning FRM_LENGTH_LINES at
+   * LONG_MAX permanently (same fixed value the pre-Part-1 code always used,
+   * confirmed stable/correct-color back then, just capped at ~16fps). If
+   * flicker/darkness disappears with this gate on, Part 1's frame-length
+   * dynamics (even with #15's hysteresis) is the real cause and needs a
+   * different fix than hysteresis. If it persists identically, Part 1 is
+   * cleared too and Part 2a's hardware crop (specifically statAreaStatic's
+   * ROI possibly sampling a shifted region post-crop, see
+   * isp_param_conf_imx219.h) becomes the prime remaining suspect. */
+  if (current_frame_length != IMX219_FRAME_LENGTH_LONG_MAX)
+  {
+      IMX219_SetFrameLength(&imx219_ctx, (uint16_t)IMX219_FRAME_LENGTH_LONG_MAX);
+      current_frame_length = IMX219_FRAME_LENGTH_LONG_MAX;
+  }
+
+  /* Slew-limit retry, see #26's writeup above SetSensorGainHelper(). */
+  {
+      int32_t delta = Exposure - isp_exposure;
+
+      if (delta > EXPOSURE_SLEW_MAX_STEP)
+      {
+          delta = EXPOSURE_SLEW_MAX_STEP;
+      }
+      else if (delta < -EXPOSURE_SLEW_MAX_STEP)
+      {
+          delta = -EXPOSURE_SLEW_MAX_STEP;
+      }
+      isp_exposure += delta;
+  }
+  return (ISP_StatusTypeDef) IMX219_SetExposure(&imx219_ctx, (uint16_t)isp_exposure);
+#else
+  static uint32_t short_ok_streak = 0U;
+  uint8_t short_is_enough = ((uint32_t)Exposure + 4U + FRAME_LENGTH_SHRINK_MARGIN)
+                             < IMX219_FRAME_LENGTH_SHORT;
+
+  if (!short_is_enough)
+  {
+      short_ok_streak = 0U;
+      if (current_frame_length != IMX219_FRAME_LENGTH_LONG_MAX)
+      {
+          if (IMX219_SetFrameLength(&imx219_ctx, (uint16_t)IMX219_FRAME_LENGTH_LONG_MAX) != 0)
+          {
+              return ISP_ERR_SENSOREXPOSURE;
+          }
+          current_frame_length = IMX219_FRAME_LENGTH_LONG_MAX;
+      }
+
+      isp_exposure = Exposure;
+      if (IMX219_SetExposure(&imx219_ctx, (uint16_t)Exposure) != 0)
+      {
+          return ISP_ERR_SENSOREXPOSURE;
+      }
+  }
+  else
+  {
+      /* Exposure would comfortably fit the SHORT frame length -- write it
+       * immediately either way (never wrong to shorten exposure), but only
+       * actually shrink FRM_LENGTH_LINES back down once this has been true
+       * for a sustained run of calls, so a single low reading during normal
+       * AEC dithering doesn't immediately yank the frame length around. */
+      isp_exposure = Exposure;
+      if (IMX219_SetExposure(&imx219_ctx, (uint16_t)Exposure) != 0)
+      {
+          return ISP_ERR_SENSOREXPOSURE;
+      }
+
+      if (current_frame_length != IMX219_FRAME_LENGTH_SHORT)
+      {
+          short_ok_streak++;
+          if (short_ok_streak >= FRAME_LENGTH_SHRINK_DEBOUNCE)
+          {
+              if (IMX219_SetFrameLength(&imx219_ctx, (uint16_t)IMX219_FRAME_LENGTH_SHORT) != 0)
+              {
+                  return ISP_ERR_SENSOREXPOSURE;
+              }
+              current_frame_length = IMX219_FRAME_LENGTH_SHORT;
+              short_ok_streak = 0U;
+          }
+      }
+  }
+
+  return ISP_OK;
+#endif /* DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH */
 }
 
 static ISP_StatusTypeDef GetSensorExposureHelper(uint32_t Instance, int32_t *Exposure)
