@@ -4,7 +4,10 @@ This document explains, from first principles, how the camera pipeline on the ST
 (NUCLEO-N65X0Q-ISP board + IMX219 sensor) actually works, and walks through every bug found
 and fixed while bringing it up. It's written for someone who has never touched MIPI CSI-2 or
 this chip before — if you know basic C and "camera modules send pixels somehow," you should be
-able to follow all of it.
+able to follow all of it. §§1-8 cover the raw sensor→RAM capture path (I2C, CSI-2/DCMIPP, RIF,
+boot chain). §9 covers what happens *after* a frame is in RAM — the USB UVC streaming pipeline
+(JPEG encoding, USBX). §10 covers the closed-source auto-exposure (AEC) library and the
+multi-session debugging saga to stop it flickering.
 
 For the terse, chronological engineering log (what was tried, in what order, with what
 hardware evidence), see [WORKLOG.md](WORKLOG.md). This document is the "why does any of this
@@ -360,3 +363,251 @@ matters: it was invisible in `dev` mode and only appeared once FSBL was actually
 5. **Distinguish "receiver is trying and failing" from "receiver was never told to try."** No
    error flags set is not the same as no error — for CSI D-PHY specifically, check the clock
    config before assuming the sensor or wiring is at fault (§3.2).
+6. **Log analysis alone is not proof of mechanism.** In the flicker saga (§10), three separate
+   theories in a row — frame-length coupling's exact scope, JPEG-encode CPU duration, a
+   USB-streaming correlation — were each built from real, consistent log evidence, and each was
+   individually disproven by the next hardware test. Log correlation tells you *what changed
+   together*; it does not tell you *why*. When a fix based on log analysis doesn't hold up, the
+   next step is a controlled experiment that isolates one variable (board physically stationary,
+   one known scene change at a time) rather than a fourth theory built from the same logs.
+7. **A config struct's field list is the ground truth for what's tunable — check it before
+   assuming a knob exists.** `ISP_AECAlgoTypeDef` (§10.2) has exactly three fields. No amount of
+   searching for "the right value" to fix AEC's convergence speed will succeed, because there is
+   no convergence-speed field to set — that logic is compiled into the closed-source `.a` file.
+   Reading the actual `struct` definition (not the docs, not what similar libraries usually
+   expose) settles this in seconds and avoids a lot of blind tuning.
+
+---
+
+## 9. USB UVC streaming pipeline: from a captured frame to a USB video packet
+
+This section picks up *after* §3 already got a frame into `video_buf[0]`/`video_buf[1]` in RAM.
+Getting that frame onto a PC as a UVC (USB Video Class) webcam feed is a second, mostly
+independent pipeline, with its own concurrency model and its own class of bugs.
+
+### 9.1 The three stages, and which thread/context each one runs in
+
+```
+DCMIPP frame-complete IRQ         CaptureUVC_Thread (prio 5)        USBX video write thread (prio 20)
+        |                                  |                                    |
+ Capture_OnFrameComplete()        ISP_BackgroundProcess()      USBD_VIDEO_StreamPayloadDone()
+  - swap ready/capture buffer      (pumps AEC/AWB, §10)          -> fill_uvc_payload()
+  - DCache invalidate                                              - once per JPEG frame: JPG_Encode()
+  - tx_semaphore_put(frame_ready)                                  - every call: copy next ~1KB chunk
+                                                                      into the USB payload buffer
+```
+
+- **`Capture_OnFrameComplete()`** (`app_threadx.c`) runs from the DCMIPP frame-event callback —
+  effectively interrupt-adjacent, so it does the absolute minimum: flip which of the two
+  `video_buf[]` halves DCMIPP writes into next, invalidate the D-Cache for the buffer that just
+  finished (so CPU reads of it see real pixel data, not stale cache lines), and post a semaphore.
+  It does **not** touch USB or JPEG at all.
+- **`CaptureUVC_Thread`** (priority 5, created in `app_threadx.c`) waits on that semaphore, then
+  calls `ISP_BackgroundProcess()` once per wake — this is the thread that keeps the AEC/AWB
+  library alive (§10). It also does periodic `[UVC_CAP]` diagnostic printfs.
+- **The actual JPEG encode happens on a *third*, lower-priority thread you don't create
+  yourself**: USBX's own internal video-streaming thread
+  (`_ux_device_class_video_write_thread_entry`, created by the USBX video class at
+  `UX_THREAD_PRIORITY_CLASS` = 20 — a much *lower* priority number-wise-higher-is-lower-priority
+  than `CaptureUVC_Thread`'s 5). Every time a USB isochronous IN payload finishes transmitting,
+  USBX calls `USBD_VIDEO_StreamPayloadDone()` (`ux_device_video.c`) on **that** thread, which
+  calls `fill_uvc_payload()`. At the start of each new JPEG frame (`uvc_frame_offset == 0`),
+  `fill_uvc_payload()` calls `JPG_Encode()` synchronously — this is the one expensive step in the
+  whole chain, and it blocks *that* USBX thread (not `CaptureUVC_Thread`) for however long it
+  takes. Every other call that frame just memcpy's the next ~1KB chunk of the already-encoded
+  JPEG buffer into the payload — cheap.
+
+### 9.2 Why there's a software double-buffer instead of using DCMIPP's own hardware DBM mode
+
+DCMIPP supports a hardware "double-buffer mode" (DBM) where the peripheral itself alternates
+between two fixed addresses every frame, no software involved. This project doesn't use it,
+because DBM can't express the one thing that actually matters here: *"don't touch this buffer,
+the JPEG encoder is still reading it."* If DCMIPP is free-running between two fixed buffers and
+the encoder is slower than the frame rate (it is — see §9.3), DCMIPP will eventually write into
+the buffer the encoder is still reading mid-encode, tearing the image.
+
+The fix implemented here is a software-mediated ping-pong: `Capture_OnFrameComplete()` only
+retargets DCMIPP to the *other* buffer if that buffer isn't the one currently locked by
+`fill_uvc_payload()` (`uvc_locked_buf_idx`). If the encoder still holds it, DCMIPP keeps
+overwriting the buffer it just finished (dropping that one camera frame) rather than touching the
+locked one. This trades an occasional dropped capture frame for guaranteed torn-frame-free output
+— the right trade for a viewable video stream.
+
+### 9.3 Why JPEG encoding needs a staging buffer regardless of source pixel format
+
+The STM32N6's hardware JPEG encoder (`HAL_JPEG_Encode`, used here in polling mode) consumes
+pixel data in **MCU-block order** (8×8 or 16×8 pixel blocks, per the JPEG spec's minimum coded
+unit), not in the scanline order the camera/DCMIPP produces. This is true *no matter what pixel
+format the source is* — RGB565 or YUV422, a reordering staging buffer (`mcu_buffer`) is
+unavoidable. What the source format *does* change is how expensive filling that staging buffer
+is:
+
+- **From RGB565** (`CVT_FormatRgb565ToYuv422Jpeg()`): has to do real RGB→YUV color-space math
+  (multiply-accumulate per pixel) on top of the reordering. Measured cost on this hardware:
+  ~18-22ms per 640×360 frame.
+- **From YUV422** (`CVT_FormatYuv422ToYuv422Jpeg()`, when DCMIPP's own hardware color-conversion
+  block already output YUV422 — §10 mentions this pipeline choice too): pure byte reordering, no
+  color math at all. Measured cost: ~5-6ms for the same frame.
+
+Since the hardware hands DCMIPP's own YUV conversion block the RGB→YUV math almost for free
+(it's a fixed pipeline stage, not extra CPU work), sourcing YUV422 instead of RGB565 is a
+straightforward, close-to-free 3-4x cut in `JPG_Encode()`'s blocking time — useful context if a
+future change needs to claw back CPU/USB-thread time (this was tried as a fix for a different
+problem in §10 and, on its own, didn't turn out to be the actual lever for that specific bug —
+but it's a real, measured win regardless).
+
+### 9.4 Sizing the frame/JPEG buffers
+
+`video_buf1`/`camera_framebuffer` are sized to the **cropped** output resolution (640×360, via
+DCMIPP's own hardware crop — see §10.3's frame-length/FPS discussion for why cropping matters
+here too), not the sensor's full native frame. `mcu_buffer`'s size is independent of pixel format
+(§9.3) — reformatting for JPEG always needs the full reordering buffer regardless of which
+`CVT_Format...` path fills it.
+
+---
+
+## 10. Auto-exposure (AEC): how it's wired up, and the flicker debugging saga
+
+### 10.1 What "ISP_MW/evision" actually is
+
+This project uses ST's closed-source ISP middleware, `ISP_MW/evision` — two precompiled static
+libraries (`libn6-evision-st-ae_gcc.a` for auto-exposure/AE, `libn6-evision-awb_gcc.a` for
+auto-white-balance/AWB) linked into the app with **no source available**. The only way to
+interact with them is:
+
+- **Config in**: `ISP_IQParamTypeDef` (`isp_param_conf_imx219.h`) — a big struct of mostly
+  static/one-time tuning values (demosaic strength, static gains, the AEC/AWB enable flags and
+  the handful of fields each exposes).
+- **Pump loop**: `ISP_BackgroundProcess()`, called every frame from `CaptureUVC_Thread`'s main
+  loop (§9.1) and also from `main.c`'s pre-RTOS warm-up loop. This is what actually runs the
+  AE/AWB algorithms against fresh statistics each frame — nothing happens without it being called
+  regularly.
+- **appliHelpers callbacks**: `GetSensorInfoHelper`/`SetSensorGainHelper`/
+  `SetSensorExposureHelper`/`GetSensorGainHelper`/`GetSensorExposureHelper`, registered once in
+  `main.c`. This is the *entire* interface between the closed-source algorithm's decisions and
+  real IMX219 I2C register writes — the algorithm never touches the sensor directly, it always
+  goes through these.
+
+**The one invariant that matters most**: whatever `SetSensorGainHelper`/`SetSensorExposureHelper`
+actually applies to hardware must be exactly what `GetSensorGainHelper`/`GetSensorExposureHelper`
+reports back on the next call. The algorithm keeps its own internal model of "what did I last
+tell the sensor to do," and if that model diverges from reality — because the helper silently
+clamped/delayed the value without saying so, or because something else (dynamic frame length,
+§10.3) changed sensor timing behind its back — its next correction is computed from a wrong
+premise and convergence breaks. Every fix that worked in this saga (§10.4's slew-limiting) obeys
+this invariant; every approach that fought it from outside without preserving it either didn't
+help or made things worse.
+
+**Statistics**: the algorithm reads back two brightness figures per frame, `stats.down` (measured
+*after* `ispGainStatic`'s R/G/B multiplication is applied) and `stats.up` (a reverse-computed
+estimate of what the brightness was *before* that gain). AEC's own exposure decisions are driven
+by `stats.down` — meaning any static gain applied in `ispGainStatic` directly biases what the
+algorithm believes the scene's true brightness is. A gain boost there once fooled AEC into
+under-exposing in bright light (documented in WORKLOG.md's Bug 23) — a good example of §10.1's
+invariant being violated one level up, in the ISP gain stage rather than the sensor stage.
+
+### 10.2 The AEC config surface is much smaller than you'd expect
+
+`ISP_AECAlgoTypeDef` (`isp_core.h`) is:
+
+```c
+typedef struct
+{
+  uint8_t enable;
+  ISP_ExposureCompTypeDef exposureCompensation;  /* -2.0 EV .. +2.0 EV in 0.5 EV steps */
+  uint32_t exposureTarget;                       /* derived from exposureCompensation, not set directly */
+  ISP_AntiFlickerTypeDef antiFlickerFreq;         /* 0, 50, or 60 (Hz) */
+} ISP_AECAlgoTypeDef;
+```
+
+That's the entire tunable surface. There is **no damping, speed, hysteresis, or convergence-rate
+field anywhere in this struct.** Whatever makes the algorithm converge quickly or slowly, smoothly
+or in large steps, is compiled into the `.a` file and cannot be adjusted from application code —
+confirmed by reading the struct definition directly, not inferred from behavior. This matters a
+lot for §10.4: it rules out an entire category of "just tune the AEC to be gentler" fixes before
+they're even tried.
+
+### 10.3 Why frame length can't be dynamic (the FPS/exposure trade-off)
+
+The sensor's frame period (`FRM_LENGTH_LINES`, IMX219 registers `0x0160`/`0x0161`) sets a hard
+ceiling on how long a single exposure can be — exposure is specified in *lines*, and can never
+exceed the frame length. A short frame length gives high FPS but caps how much exposure AEC can
+ask for in low light; a long frame length gives more exposure headroom (better low-light image)
+at the cost of FPS. On this sensor/lens/binning config, measured on real hardware:
+`FRM_LENGTH_LINES=1763` → ~31 FPS, `FRM_LENGTH_LINES=3526` → ~16 FPS.
+
+The tempting design (and the one this project tried first) is to make this dynamic: let AEC's own
+exposure decisions drive `FRM_LENGTH_LINES` live — grow it only when an exposure request needs
+more room, shrink it back when there's enough light to run fast. This **does not work** with a
+closed-source AEC that has no way to be told its own sensor's timing just changed underneath it.
+Every version tried — continuously recomputing the frame length every call, then a coarser
+2-state switch with a 60-call shrink debounce — still broke AEC's convergence (visible as
+flickering brightness), because changing `FRM_LENGTH_LINES` mid-stream violates §10.1's invariant
+in a way neither helper function can paper over: the sensor's actual line-time changes, so a
+given exposure register value now corresponds to a different real exposure duration than AEC
+believes.
+
+**The confirming evidence, from comparing against ST's own official IMX335 camera pipeline**
+(`STM32N6_Face_Recognition`, `stm32-mw-camera/sensors/imx335/imx335.c`): the real reference driver
+ships five pre-validated register tables, one per supported FPS (10/15/20/25/30), and FPS is
+selected **once**, before streaming starts (`IMX335_SetFrameRate()`), never touched again while
+AEC runs. Raspberry Pi/libcamera does the same thing (a fixed per-mode frame duration; its AGC
+only ever trades exposure/gain *within* that fixed period). This project's fix matches that
+pattern: `FRM_LENGTH_LINES` is now pinned at a single fixed value for the entire streaming
+session (`DEBUG_DISABLE_DYNAMIC_FRAME_LENGTH` in `main.c` — the name is a holdover from when this
+was still being isolated as a test; functionally it's now just "frame length is static," which is
+the permanent, correct design here, not a temporary debug flag). If variable FPS is wanted again
+in the future, it needs to be a discrete mode switch (re-init between a small number of fixed
+profiles), never a live per-frame AEC-driven adjustment.
+
+### 10.4 The flicker debugging saga: four theories, three wrong, one confirmed fix
+
+With frame length fixed (§10.3), a *second*, unrelated flicker remained: `isp_gain`/
+`isp_exposure` would swing between extremes specifically when the camera was pointed at a bright
+highlight (a window, a light, outdoors), while sitting perfectly rock-stable — pinned at a single
+value for minutes at a time — whenever it wasn't. Four theories were chased, in order, each
+tested on real hardware rather than assumed:
+
+1. **JPEG-encode CPU duration** (a plausible read of "oscillates only while USB streaming is
+   active"): restoring DCMIPP's hardware YUV422 conversion (§9.3) cut `JPG_Encode()`'s blocking
+   time from ~24ms to ~10ms — **no change** in the oscillation. Disproven.
+2. **The Stream-ON/OFF correlation itself**: further testing (a controlled, hands-off setup, board
+   resting untouched, pointed at a fixed scene) showed the real discriminator was never USB
+   activity at all — it was almost certainly the board being physically handled/moved while a
+   phone recorded the live screen during "streaming" tests, vs. resting still during "not
+   streaming" gaps. Coincidental correlation, not a cause.
+3. **Global exposure compensation** (`exposureCompensation`, §10.2 — the one real tuning knob
+   available): `-1.0 EV` eliminated the hunting completely (rock-steady, matching the "pointed
+   away from bright content" baseline) but pinned exposure/gain at the absolute floor — a fully
+   black image in *every* condition, not just bright ones. `-0.5 EV` was still too dark. Root
+   issue: this is a single *global* number applied to every scene uniformly; there's no value
+   that keeps normal-light scenes visible while also being dark enough to prevent a bright
+   highlight from forcing a large, hunt-prone correction. Retired.
+4. **Slew-rate-limiting the sensor writes** (the fix that worked): clamp the per-call change to
+   `isp_gain`/`isp_exposure` in `SetSensorGainHelper()`/`SetSensorExposureHelper()` to a fixed
+   maximum step, and — critically, per §10.1's invariant — report back the *actually-applied,
+   slewed* value via `GetSensorGainHelper()`/`GetSensorExposureHelper()`, never the raw AEC
+   request. This is the same technique Raspberry Pi/libcamera's AGC uses (its "speed" parameter)
+   to avoid exactly this failure mode. Confirmed on hardware: smooth, gradual brightness
+   transitions instead of hard jumps, in both directions.
+
+Why the *first* attempt at this exact fix (tried earlier in the same debugging arc, before frame
+length was made static) looked like a failure at the time: a slew-limited actuator chasing a
+target that's *also* being independently perturbed (by the still-live dynamic-frame-length bug,
+§10.3) can never catch up — it gets stuck partway, which looked like "slew-limiting makes the
+image stuck too dark" but was really two bugs compounding. Once §10.3 was fixed first, the same
+technique worked cleanly. **Lesson**: when a fix doesn't work, check whether an *independent* bug
+was still active during that test before concluding the fix itself was wrong.
+
+### 10.5 Root cause, stated plainly
+
+Simple average-luma auto-exposure (no highlight weighting, no histogram-based metering, no HDR)
+pointed at a scene containing both a bright highlight and normal room content will, in general,
+need a large, fast correction whenever the highlight enters or leaves the metering window — and
+if the algorithm's steady-state for "normal" content already sits at a hard gain/exposure ceiling
+(as it does in typical indoor light on this sensor/lens combo), that large correction starts from
+right at a saturation boundary, which is where simple control loops hunt. This is a real,
+well-known limitation of basic AEC algorithms in backlit/highlight scenes, not a bug unique to
+this project or this session's changes — the fix available without AEC source access is damping
+the actuator (§10.4, item 4), not eliminating the underlying tendency to want a large correction
+in the first place.
