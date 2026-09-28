@@ -182,8 +182,22 @@ static const IMX219_Reg_t imx219_common_regs[] =
     {0x0307,0x39},
     {0x030B,0x01},
     {0x030C,0x00},
-    //{0x030D,0x72},
-	{0x030D,0x1C}, // change here (div 4)
+    /* Bug 18 (see WORKLOG.md): this was hand-edited to 0x1C ("div 4"),
+     * cutting PLL_OP_MPY from 114 to 28 -- i.e. the MIPI output PLL, which
+     * sets the actual CSI-2 per-lane bit rate (bit_rate_Mbps = INCK_MHz /
+     * PREPLLCK_OP_DIV / OPSYCK_DIV * PLL_OP_MPY = 24/3/1*114 = 912 Mbps at
+     * the correct value, vs only ~224 Mbps at 0x1C). ../Camera_N6_AI_Test
+     * (confirmed working on this exact IMX219 module, same 640x480 RAW10
+     * 2-lane 30fps config, same PLL_VT/PREPLLCK settings otherwise
+     * identical to this table) uses 0x72 with DCMIPP_CSI_PHY_BT_900 and
+     * only has color/FPS issues, no striping -- this is almost certainly
+     * the root cause of the exact, deterministic period-32-row corruption
+     * chased through Bugs 15-17: running the D-PHY link at ~4x below its
+     * intended bit rate is a physical-layer misconfiguration, not
+     * something any DCMIPP register (IPPlug, ISP) can compensate for.
+     * Restored to the reference project's confirmed-working value; see
+     * main.c's matching PHYBitrate change (PHY_BT_220 -> PHY_BT_900). */
+    {0x030D,0x72},
 
 	/* Undocumented registers */
 	{0x455E,0x00},
@@ -215,9 +229,16 @@ static const IMX219_Reg_t imx219_common_regs[] =
      * Frame timing
      * ========================================================= */
 
-    /* Frame length lines = 0x06E3 = 1763 */
-    {0x0160, 0x06},
-    {0x0161, 0xE3},
+    /* Bug 18 continued (see WORKLOG.md): FRM_LENGTH_LINES here was 0x06E3
+     * (1763) -- exactly HALF of ../Camera_N6_AI_Test's confirmed-working
+     * 0x0DC6 (3526) for this same 640x480 2-lane 30fps config. A shorter
+     * frame length means less vertical blanking time between frames, which
+     * lines up with the same "someone halved/quartered sensor timing
+     * without adjusting everything else consistently" pattern as the
+     * 0x030D PLL edit above. Restored to match the reference exactly. */
+    /* Frame length lines = 0x0DC6 = 3526 */
+    {0x0160, 0x0D},
+    {0x0161, 0xC6},
 
     /* Line length pixels = 0x0D78 = 3448 */
     {0x0162, 0x0D},
@@ -281,8 +302,15 @@ static const IMX219_Reg_t imx219_640x480_regs[] =
     {0x0170, 0x01},
     {0x0171, 0x01},
 
-    {0x0174, 0x01}, //
-    {0x0175, 0x01}, //
+    /* Bug 18 continued (see WORKLOG.md): BINNING_MODE_H_A/V_A were 0x01/0x01
+     * here, with a stripped trailing comment ("//") matching the same
+     * tamper pattern as the 0x030D PLL edit and the halved FRM_LENGTH_LINES
+     * above. ../Camera_N6_AI_Test (confirmed working, identical sensor
+     * window/output size) uses 0x03/0x03 for 2x2 analog binning. Restored
+     * to match -- a different binning submode here changes the sensor's
+     * internal analog readout timing, not just software-visible output. */
+    {0x0174, 0x03}, /* BINNING_MODE_H_A = 2x2 */
+    {0x0175, 0x03}, /* BINNING_MODE_V_A = 2x2 */
 
 	{0x0624, 0x06},
 	{0x0625, 0x68},
@@ -359,11 +387,19 @@ static int32_t IMX219_Configure640x480(
     }
 
     /*
-     * 4. Frame length = 0x06E3
+     * Bug 21 (see WORKLOG.md): this explicit write ran AFTER
+     * imx219_common_regs (which sets FRM_LENGTH_LINES via the table --
+     * see Bug 18) and unconditionally overwrote it back to 0x06E3=1763,
+     * silently undoing Bug 18's fix on every single init this whole time.
+     * Both this and the table happened to agree before Bug 18 (both wrong
+     * at 1763), which is exactly why nothing caught the duplication then.
+     * Updated to match the table's corrected value.
+     *
+     * 4. Frame length = 0x0DC6 (3526, see ../Camera_N6_AI_Test)
      */
 
-    uint8_t frame_length_msb = 0x06;
-    uint8_t frame_length_lsb = 0xE3;
+    uint8_t frame_length_msb = 0x0D;
+    uint8_t frame_length_lsb = 0xC6;
 
 
     status =

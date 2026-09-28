@@ -27,6 +27,7 @@
 #include "isp_api.h"
 #include "isp_core.h"
 #include "isp_param_conf_imx219.h"
+#include "app_threadx.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,8 +66,23 @@ ISP_HandleTypeDef  hcamera_isp;
 
 IMX219_CTX_t imx219_ctx;
 
-static int32_t isp_gain = 0;
-static int32_t isp_exposure = 0;
+/* Bug 21 (see WORKLOG.md): these must start matching what IMX219_Configure640x480()
+ * actually writes to the sensor at init (gain=0x00, exposure=0x0640=1600) --
+ * GetSensorGainHelper()/GetSensorExposureHelper() report these back to
+ * evision's AEC as "the sensor's current state", and if they start out
+ * wrong (e.g. exposure=0 while the sensor is really sitting at 1600), AEC's
+ * very first correction is computed against a lie, which is consistent
+ * with the "flashes bright then crushes to near-black" symptom seen right
+ * after AECAlgo was first enabled -- the sensor's real starting exposure
+ * (1600, genuinely bright) got misread as 0 (minimum), so AEC's first
+ * control step swung drastically in the wrong direction. */
+/* Not static: app_threadx.c's UVC loop prints these to see what AEC has
+ * actually converged the sensor to (see Bug 21's "still dark" follow-up in
+ * WORKLOG.md) -- FPS halving (31->16) after enabling AEC strongly suggests
+ * exposure is being driven at/near the frame-length ceiling; confirm with
+ * real numbers instead of guessing further. */
+int32_t isp_gain = 0;
+int32_t isp_exposure = 1600;
 
 //__attribute__((aligned(32)))
 //static uint8_t camera_framebuffer[FRAME_BUFFER_SIZE];
@@ -87,6 +103,10 @@ volatile uint32_t csi_ier0 = 0;
 volatile uint32_t csi_ier1 = 0;
 volatile uint32_t sot_lane0_count = 0;
 volatile uint32_t sot_lane1_count = 0;
+
+/* USB OTG HS PCD handle -- used by app_usbx_device.c's device thread
+ * (MX_USB1_OTG_HS_PCD_Init() + HAL_PCD_Start()) once ThreadX is running. */
+PCD_HandleTypeDef hpcd_USB_OTG_HS1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -281,6 +301,43 @@ int main(void)
       camera_framebuffer[3]
   );
 
+  /*
+   * Bug 17 investigation (see WORKLOG.md): the periodic 32-row 0xFF
+   * corruption survived two independent, hardware-confirmed-correct
+   * IPPlug reconfigurations (MemoryPageSize and MaxOutstandingTransactions),
+   * ruling out the AXI write-master's timing/throughput settings entirely.
+   * Before chasing the ISP/pixel-pipe hardware next, rule out the simplest
+   * remaining explanation: that these exact byte addresses are not really
+   * writable RAM at all (a physical gap/alias, not a DMA problem). The
+   * memset() above should have zeroed every byte in this buffer, and the
+   * SCB_CleanDCache_by_Addr() call just above flushed that write out to
+   * physical memory. If these specific bytes don't read back 0x00 here --
+   * before DCMIPP has ever touched the buffer -- then DCMIPP was never at
+   * fault: the CPU's own write didn't stick, meaning this address range is
+   * not genuinely backed, writable memory.
+   */
+  /* Bug 17-19 diagnostic, no longer needed now that Bug 19's IPPlug
+   * WLRURatio/DPREGStart/DPREGEnd fix confirmed the striping fixed (see
+   * WORKLOG.md) -- flip to 1 to re-run this write-back check if a similar
+   * corruption is ever suspected again. */
+#define DEBUG_MEM_TEST 0
+#if DEBUG_MEM_TEST
+  printf("[MEM_TEST] pre-capture CPU write-back check at known-bad-row offsets:\r\n");
+  {
+      static const uint32_t bad_rows[] = {24U, 56U, 88U, 120U, 152U, 184U, 216U,
+                                          248U, 280U, 312U, 344U, 376U, 408U, 440U, 472U};
+      SCB_InvalidateDCache_by_Addr((uint32_t *)camera_framebuffer, FRAME_BUFFER_SIZE);
+      for (uint32_t _i = 0U; _i < (sizeof(bad_rows) / sizeof(bad_rows[0])); _i++)
+      {
+          uint32_t _row = bad_rows[_i];
+          uint8_t _b0 = camera_framebuffer[_row * 1280U];
+          uint8_t _b1 = camera_framebuffer[_row * 1280U + 1U];
+          printf("  row%03lu byte0/1 = %02X %02X %s\r\n", (unsigned long)_row, _b0, _b1,
+                 ((_b0 == 0U) && (_b1 == 0U)) ? "OK" : "*** STUCK, NOT WRITABLE ***");
+      }
+  }
+#endif
+
 //
   /* Fill init struct with Camera driver helpers */
   appliHelpers.GetSensorInfo = GetSensorInfoHelper;
@@ -312,7 +369,41 @@ int main(void)
   }
 
   printf("after ISP_Start\r\n");
-//
+
+  /*
+   * Bug 17 investigation, round 3 (see WORKLOG.md): the full 480-row scan
+   * found an exact, deterministic period-32 pattern -- 12 of every 32 rows
+   * corrupted at fixed offsets, present even with zero system load. This
+   * has already ruled out AXI/IPPlug timing (two parameters changed,
+   * hardware-confirmed via register readback, zero effect) and the
+   * destination memory itself (CPU write-back test passed on every
+   * known-bad row). That leaves the hardware pixel pipe between CSI
+   * ingest and the AXI write: either the raw CSI/DCMIPP capture path
+   * itself, or the ISP's hardware Bayer2RGB demosaic block PIPE1 always
+   * runs data through (DCMIPP_PIXEL_PACKER_FORMAT_RGB565_1 requires it --
+   * there's no raw-passthrough packer format available on PIPE1).
+   *
+   * This is a one-shot bisection test: disable the demosaic block only
+   * (leaving everything else -- CSI, IPPlug, pixel packer -- exactly as
+   * configured) and re-run the same [MEM_SCAN]. The image itself will
+   * look wrong (raw Bayer data reinterpreted as RGB565, not real colors)
+   * but that doesn't matter for this test -- only whether the same
+   * period-32 0xFF pattern is still there:
+   *   - Pattern GONE  -> the demosaic hardware block is the culprit.
+   *   - Pattern SAME  -> demosaic is innocent; the bug is upstream, in
+   *                      CSI reception or DCMIPP's own raw capture path.
+   * TEMPORARY -- revert this block (or flip the #if to 0) once the test
+   * result is read; do not ship with demosaic disabled.
+   */
+#define BUG17_DEMOSAIC_BISECT_TEST 0
+#if BUG17_DEMOSAIC_BISECT_TEST
+  printf("[BUG17_TEST] disabling ISP RawBayer2RGB demosaic for this run\r\n");
+  if (HAL_DCMIPP_PIPE_DisableISPRawBayer2RGB(&hdcmipp, DCMIPP_PIPE1) != HAL_OK)
+  {
+      printf("[BUG17_TEST] HAL_DCMIPP_PIPE_DisableISPRawBayer2RGB FAILED\r\n");
+  }
+#endif
+
   /* ============================================================
    * Start DCMIPP snapshot
    * ============================================================ */
@@ -425,6 +516,140 @@ int main(void)
       {
           printf("BGP OK\r\n");
       }
+
+      /* Bug 15-19 diagnostics, no longer needed now that Bug 19's IPPlug
+       * fix confirmed the striping fixed (see WORKLOG.md) -- flip to 1 to
+       * re-run this row/frame corruption scan if similar symptoms recur. */
+#define DEBUG_MEM_SCAN 0
+#if DEBUG_MEM_SCAN
+      /*
+       * Bug 15 investigation, round 3 (see WORKLOG.md): the UVC-streamed
+       * image is corrupted past roughly row 68 of every frame, but DCMIPP
+       * itself reports zero errors (no overrun, no pipe error, no D-PHY
+       * fault) the entire time -- ruling out every hypothesis tried so
+       * far. This is a controlled experiment to isolate whether that
+       * truncation is inherent to CONTINUOUS-mode capture itself, or
+       * specific to running under RTOS+USB+JPEG system load: this warmup
+       * loop just finished dozens of continuous-mode PIPE1 captures into
+       * this exact same camera_framebuffer address, with ZERO USB/JPEG
+       * DMA activity competing for AXI bandwidth (ThreadX/USBX haven't
+       * even started yet at this point in main()). Dump the same
+       * row-60/68/76 pattern the UVC path checks -- if row 68+ is already
+       * 0xFF here too, the bug has nothing to do with USB/JPEG contention;
+       * if it's real valid data here, contention is confirmed as the
+       * cause.
+       */
+      SCB_InvalidateDCache_by_Addr((uint32_t *)camera_framebuffer, FRAME_BUFFER_SIZE);
+      printf("[WARMUP_SRC] row60  first32B: ");
+      for (uint32_t _i = 0U; _i < 32U; _i++)
+          printf("%02X ", camera_framebuffer[60U * 1280U + _i]);
+      printf("\r\n[WARMUP_SRC] row68  first32B: ");
+      for (uint32_t _i = 0U; _i < 32U; _i++)
+          printf("%02X ", camera_framebuffer[68U * 1280U + _i]);
+      printf("\r\n[WARMUP_SRC] row76  first32B: ");
+      for (uint32_t _i = 0U; _i < 32U; _i++)
+          printf("%02X ", camera_framebuffer[76U * 1280U + _i]);
+      printf("\r\n[WARMUP_SRC] row200 first32B: ");
+      for (uint32_t _i = 0U; _i < 32U; _i++)
+          printf("%02X ", camera_framebuffer[200U * 1280U + _i]);
+      printf("\r\n[WARMUP_SRC] row400 first32B: ");
+      for (uint32_t _i = 0U; _i < 32U; _i++)
+          printf("%02X ", camera_framebuffer[400U * 1280U + _i]);
+      printf("\r\n");
+
+      /*
+       * Bug 15 investigation, round 4: rows 68/76 read as 0xFF while rows
+       * 200/400 read as real data, EVEN WITH ZERO SYSTEM LOAD (this is the
+       * pre-RTOS warmup loop). That is not a truncation pattern -- it is a
+       * *localized band* of bad memory somewhere between row ~68 and row
+       * 200, with good memory both before and after it. camera_framebuffer
+       * lives at a hardcoded fixed address (CAMERA_BUFFER_ADDR =
+       * 0x34200000) that sits exactly at the end of the linker's own `RAM`
+       * region (STM32N657X0HXQ_LRUN.ld: ORIGIN 0x34000400, LENGTH 2047K ->
+       * ends at 0x34200000) -- i.e. it was deliberately placed in a
+       * *different*, separate physical RAM bank specifically so it
+       * wouldn't eat into the tight 2047K budget everything else shares.
+       * The suspicion: that separate bank (or the next one after it) may
+       * not be as large / contiguous as assumed, and part of this 614400-
+       * byte buffer may fall into a real gap between two physical SRAM
+       * blocks (unbacked address space reads back as 0xFF on this chip).
+       * Binary-search the actual boundaries empirically instead of relying
+       * on remembered reference-manual numbers -- byte 0 of every 8th row
+       * is enough to map where "valid" flips to "0xFF" and back.
+       */
+      /*
+       * Bug 17 investigation, round 2 (see WORKLOG.md): the coarse every-8th-
+       * row scan below made the bad rows look like a clean "every 32nd row"
+       * period (24, 56, 88, ...) -- but this project's own earlier
+       * row-60/68/76/200/400 spot-checks (still printed above, unchanged)
+       * showed row 68 and row 76 BOTH bad while the coarse scan's neighbors
+       * at 64/72/80 are all good -- i.e. the true bad-row set is NOT evenly
+       * spaced at exactly 32, the 8-row stride was just aliasing a messier
+       * pattern into a falsely clean-looking one. Scan EVERY row (not every
+       * 8th) and check three columns per row (start/middle/end), so the next
+       * log shows the real shape of the defect instead of a stride artifact:
+       * whether it's a clean period, an irregular/jittery pattern (pointing
+       * at a CSI line-sync glitch rather than an AXI/IPPlug timing issue,
+       * both of which are now ruled out -- see WORKLOG.md), and whether each
+       * bad row is corrupted end-to-end or only partially.
+       */
+      printf("[MEM_SCAN] full 480-row scan, col0 bitmap ('.'=ok '#'=FFFF):\r\n");
+      {
+          static uint8_t bad[480];
+          uint32_t bad_count = 0U;
+          uint32_t full_line_bad_count = 0U;
+          uint32_t prev_bad_row = 0xFFFFFFFFU;
+          uint32_t min_gap = 0xFFFFFFFFU;
+          uint32_t max_gap = 0U;
+
+          for (uint32_t _row = 0U; _row < 480U; _row++)
+          {
+              uint16_t _col0 = ((uint16_t)camera_framebuffer[_row * 1280U] << 8) |
+                                camera_framebuffer[_row * 1280U + 1U];
+              bad[_row] = (_col0 == 0xFFFFU) ? 1U : 0U;
+
+              if (bad[_row])
+              {
+                  uint16_t _colmid = ((uint16_t)camera_framebuffer[_row * 1280U + 640U] << 8) |
+                                      camera_framebuffer[_row * 1280U + 641U];
+                  uint16_t _colend = ((uint16_t)camera_framebuffer[_row * 1280U + 1278U] << 8) |
+                                      camera_framebuffer[_row * 1280U + 1279U];
+                  if ((_colmid == 0xFFFFU) && (_colend == 0xFFFFU))
+                  {
+                      full_line_bad_count++;
+                  }
+                  bad_count++;
+                  if (prev_bad_row != 0xFFFFFFFFU)
+                  {
+                      uint32_t _gap = _row - prev_bad_row;
+                      if (_gap < min_gap) { min_gap = _gap; }
+                      if (_gap > max_gap) { max_gap = _gap; }
+                  }
+                  prev_bad_row = _row;
+              }
+          }
+
+          for (uint32_t _row = 0U; _row < 480U; _row++)
+          {
+              printf("%c", bad[_row] ? '#' : '.');
+              if (((_row + 1U) % 64U) == 0U) { printf("\r\n"); }
+          }
+
+          printf("\r\n[MEM_SCAN] bad_rows=%lu (of which full-line bad=%lu)  "
+                 "gap_between_bad_rows: min=%lu max=%lu\r\n",
+                 (unsigned long)bad_count, (unsigned long)full_line_bad_count,
+                 (unsigned long)((min_gap == 0xFFFFFFFFU) ? 0U : min_gap),
+                 (unsigned long)max_gap);
+
+          printf("[MEM_SCAN] bad row numbers: ");
+          for (uint32_t _row = 0U; _row < 480U; _row++)
+          {
+              if (bad[_row]) { printf("%lu ", (unsigned long)_row); }
+          }
+          printf("\r\n");
+      }
+      printf("[MEM_SCAN] done\r\n");
+#endif /* DEBUG_MEM_SCAN */
   }
 
   /* stop the acquisition */
@@ -589,21 +814,26 @@ int main(void)
   BSP_LED_Init(LED_RED);
   BSP_LED_Init(LED_GREEN);
 
-  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /*
+   * Single-shot capture verification above is done (frame confirmed
+   * good/bad on real hardware, exactly as before -- untouched). Instead of
+   * the old LED-blink idle loop, hand off to ThreadX: MX_ThreadX_Init()
+   * starts the RTOS kernel, whose capture thread (app_threadx.c) restarts
+   * PIPE1 in continuous mode and streams RGB565->MJPEG frames out over USB
+   * UVC (app_usbx_device.c / ux_device_video.c). tx_kernel_enter() never
+   * returns.
+   */
+  BSP_LED_On(LED_GREEN);
+  printf("\r\n[MAIN] Single-shot verification complete -- starting ThreadX/USBX UVC pipeline\r\n");
+  MX_ThreadX_Init();
+
+  /* Unreachable. */
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
   while (1)
   {
-	    HAL_Delay(200);
-	    BSP_LED_Toggle(LED_RED);
-	    HAL_Delay(200);
-	    BSP_LED_Toggle(LED_GREEN);
-//	    HAL_Delay(200);
-//	    BSP_LED_Toggle(LED_BLUE);
-	    HAL_Delay(200);
-	    printf("ok\r\n");
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
@@ -688,7 +918,16 @@ static void MX_DCMIPP_Init(void)
   {
     Error_Handler();
   }
-  pCSI_Config.PHYBitrate = DCMIPP_CSI_PHY_BT_220;
+  /* Bug 18 (see WORKLOG.md): must match imx219.c's PLL_OP_MPY (register
+   * 0x030D). That was found hand-edited to a value giving ~224 Mbps/lane
+   * instead of the correct ~912 Mbps/lane for this exact sensor/resolution
+   * (confirmed against ../Camera_N6_AI_Test, which uses 0x72 + BT_900 on
+   * the same IMX219 640x480 RAW10 2-lane 30fps config and has no striping).
+   * Running the D-PHY receiver's bit-rate calibration ~4x below the link's
+   * actual intended speed is almost certainly the root cause of the exact,
+   * deterministic period-32-row corruption chased through Bugs 15-17 --
+   * a physical-layer mismatch no DCMIPP/ISP register can compensate for. */
+  pCSI_Config.PHYBitrate = DCMIPP_CSI_PHY_BT_900;
   pCSI_Config.DataLaneMapping = DCMIPP_CSI_PHYSICAL_DATA_LANES;
   pCSI_Config.NumberOfLanes = DCMIPP_CSI_TWO_DATA_LANES;
   HAL_DCMIPP_CSI_SetConfig(&hdcmipp, &pCSI_Config);
@@ -719,23 +958,80 @@ static void MX_DCMIPP_Init(void)
    * PIPE0 is never started in this app, so it is left unconfigured and
    * CLIENT2 can safely take the whole FIFO pool.
    */
+  /*
+   * Bug 16 (see WORKLOG.md): MemoryPageSize (64 bytes) was configured
+   * SMALLER than Traffic's AXI burst size (128 bytes) -- backwards from
+   * what this field is for (it describes the memory-side page/row boundary
+   * IPPlug must not let a single burst straddle). This has been wrong
+   * since this exact IPPlug config was first added (the original PIPE1
+   * overrun fix, this session's very first bug), and produced a perfectly
+   * periodic corruption -- every 32nd captured row (rows congruent to a
+   * fixed value mod 32, confirmed via a full 480-row memory scan) read
+   * back as untouched 0xFF -- present even with zero system load, so not
+   * a USB/JPEG contention issue. Every existing diagnostic in this project
+   * only ever printed/checked row 0 (never in the corrupted phase by
+   * construction, since the corrupted rows are offset from a multiple of
+   * 32), which is why a burst/page mismatch that's been present since the
+   * very first camera bring-up was never caught until the UVC pipeline
+   * finally made the full frame visible.
+   *
+   * Bug 17 (see WORKLOG.md): the 256-byte MemoryPageSize fix above was
+   * flashed and produced a byte-for-byte IDENTICAL 32-row periodic 0xFF
+   * pattern -- proof this specific field was never the real lever (the
+   * old confirmation printf below only read back IPC2R1/R2/R3, the
+   * per-client registers, and never actually checked IPGR1, the register
+   * MemoryPageSize is written to -- so the previous "fix" was flashed
+   * without ever confirming the write took hold in hardware at all).
+   * Two changes this round: (1) print IPGR1 too, so a stale/rejected write
+   * is now visible instead of assumed; (2) as the next candidate lever
+   * per this project's own contingency plan, cut MaxOutstandingTransactions
+   * way down (16 -> 4) -- if 16 in-flight 128B writes is more than this
+   * particular AXI target bank can sustain, its own internal queue could
+   * be silently dropping/corrupting writes on a fixed period unrelated to
+   * MemoryPageSize entirely, which would explain why quadrupling the page
+   * size changed nothing.
+   */
+  /*
+   * Bug 19 (see WORKLOG.md): Bug 18's IMX219 PLL/binning/frame-length fixes
+   * were flashed, confirmed to actually reach hardware (different real
+   * pixel brightness values captured), and STILL produced the exact same
+   * byte-for-byte period-32 corruption. Combined with Bugs 16/17 (IPPlug
+   * MemoryPageSize/MaxOutstandingTransactions, also confirmed via register
+   * readback) and the demosaic bisection test, every hypothesis tried so
+   * far has been conclusively falsified with hardware evidence. Two IPPlug
+   * fields were never actually varied: WLRURatio (AXI arbitration weight)
+   * and DPREGStart/DPREGEnd (this client's slice of the shared internal
+   * FIFO). ../Camera_N6_AI_Test's CLIENT2 (its own PIPE1, the confirmed-
+   * working active capture pipe) uses WLRURatio=4 (not 15) and
+   * DPREGStart/End=0x100/0x1FF, a 256-word half of the FIFO (not the full
+   * 0x000-0x3FF pool this project gives CLIENT2). Matching those exactly,
+   * along with MemoryPageSize/Traffic (both back to 64 bytes, equal to
+   * each other -- the reference proves 64/64 works fine, so Bug 16's
+   * "page must be > burst" theory was never right either) and
+   * MaxOutstandingTransactions=8, to fully exhaust the IPPlug parameter
+   * space against a known-working configuration instead of guessing
+   * further blind.
+   */
   DCMIPP_IPPlugConfTypeDef pIPPlugConfig = {0};
   pIPPlugConfig.Client                     = DCMIPP_CLIENT2;
   pIPPlugConfig.MemoryPageSize             = DCMIPP_MEMORY_PAGE_SIZE_64BYTES;
-  pIPPlugConfig.Traffic                    = DCMIPP_TRAFFIC_BURST_SIZE_128BYTES;
-  pIPPlugConfig.MaxOutstandingTransactions = DCMIPP_OUTSTANDING_TRANSACTION_16;
-  pIPPlugConfig.WLRURatio                  = 15U;
-  pIPPlugConfig.DPREGStart                 = 0x000U;
-  pIPPlugConfig.DPREGEnd                   = 0x3FFU;
+  pIPPlugConfig.Traffic                    = DCMIPP_TRAFFIC_BURST_SIZE_64BYTES;
+  pIPPlugConfig.MaxOutstandingTransactions = DCMIPP_OUTSTANDING_TRANSACTION_8;
+  pIPPlugConfig.WLRURatio                  = 4U;
+  pIPPlugConfig.DPREGStart                 = 0x100U;
+  pIPPlugConfig.DPREGEnd                   = 0x1FFU;
   if (HAL_DCMIPP_SetIPPlugConfig(&hdcmipp, &pIPPlugConfig) != HAL_OK)
   {
     Error_Handler();
   }
 
   /* Read back what actually landed in hardware, not just what we asked
-   * for -- confirms the IPPlug fix took effect before any capture starts. */
-  printf("IPPlug CLIENT2: IPC2R1=0x%08lX IPC2R2=0x%08lX IPC2R3=0x%08lX\r\n",
-         DCMIPP->IPC2R1, DCMIPP->IPC2R2, DCMIPP->IPC2R3);
+   * for -- confirms the IPPlug fix took effect before any capture starts.
+   * Bug 17: IPGR1 (MemoryPageSize, a GLOBAL register, not per-client) was
+   * missing from this readback -- add it so a rejected/stale page-size
+   * write is visible instead of silently assumed. */
+  printf("IPPlug CLIENT2: IPGR1=0x%08lX IPC2R1=0x%08lX IPC2R2=0x%08lX IPC2R3=0x%08lX\r\n",
+         DCMIPP->IPGR1, DCMIPP->IPC2R1, DCMIPP->IPC2R2, DCMIPP->IPC2R3);
 
   /* USER CODE END DCMIPP_Init 2 */
 
@@ -859,6 +1155,25 @@ static void MX_LPUART1_UART_Init(void)
   HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_DCMIPP, &RIMC_master);
 
   /*
+   * Bug 10 (see WORKLOG.md): RIF_MASTER_INDEX_OTG1 (RIMC) and
+   * RIF_RISC_PERIPH_INDEX_OTG1HS / RIF_RISC_PERIPH_INDEX_JPEG (RISC) were
+   * never added here when the UVC/ThreadX pipeline introduced USB and the
+   * HW JPEG encoder -- this function predates both and was never revisited.
+   * The comment below (from the original I2C RIF bug, Bug 2) already
+   * documented that the reference project's Security_Config() sets exactly
+   * these for OTG1/OTG1HS/JPEG -- it just never got acted on until now.
+   * Symptom without this: USB enumerates far enough to chirp/negotiate High
+   * Speed (host sees "new high-speed USB device"), but every subsequent
+   * control transfer that actually moves data over AXI via the OTG core's
+   * internal DMA (dma_enable=ENABLE in MX_USB1_OTG_HS_PCD_Init) times out --
+   * `dmesg`: "device descriptor read/64, error -110" -- because RIF
+   * silently drops the OTG DMA's AXI writes/reads instead of erroring,
+   * exactly like Bug 2's I2C2 pins. Same root cause pattern, different
+   * peripheral.
+   */
+  HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_OTG1, &RIMC_master);
+
+  /*
    * RIF_MASTER_INDEX_ETH1 and its whole associated GPIO security block
    * (originally: GPIOA_10/11, GPIOB_0/3/6/7/10/11, GPIOE_3/5/6 all marked
    * GPIO_PIN_SEC) were removed here.
@@ -882,6 +1197,12 @@ static void MX_LPUART1_UART_Init(void)
 
   /* USER CODE BEGIN RIF_Init 1 */
   HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_DCMIPP , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
+  /* Bug 10 (see WORKLOG.md) -- USB OTG1 HS and the HW JPEG encoder, both
+   * now in active use by the UVC pipeline, need the same RISC slave
+   * attribute the camera peripherals already had, or RIF silently drops
+   * their AXI DMA transactions. */
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_OTG1HS, RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_JPEG,   RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
   /* USER CODE END RIF_Init 1 */
   /* USER CODE BEGIN RIF_Init 2 */
 
@@ -921,6 +1242,15 @@ HAL_UART_Transmit(&hlpuart1, (uint8_t *) ptr, len, HAL_MAX_DELAY);
 return len;
 }
 
+/* Set by app_threadx.c's capture thread once continuous UVC capture has
+ * started; forwards frame-complete events to its double-buffer swap logic.
+ * See app_threadx.c's file header for why this is a separate hook function
+ * rather than a second definition of this HAL callback (this callback is
+ * also used, unmodified below, by the single-shot warmup/verification
+ * above, which must not be touched). */
+extern volatile uint8_t uvc_capture_active;
+extern void Capture_OnFrameComplete(DCMIPP_HandleTypeDef *hdcmipp);
+
 void HAL_DCMIPP_PIPE_FrameEventCallback(
     DCMIPP_HandleTypeDef *hdcmipp,
     uint32_t Pipe)
@@ -929,6 +1259,11 @@ void HAL_DCMIPP_PIPE_FrameEventCallback(
     {
         frame_count++;
         frame_received = 1U;
+
+        if (uvc_capture_active)
+        {
+            Capture_OnFrameComplete(hdcmipp);
+        }
     }
 }
 
@@ -1101,11 +1436,28 @@ static ISP_StatusTypeDef GetSensorInfoHelper(uint32_t Instance,
     Info->width  = 640;
     Info->height = 480;
 
+    /* Bug 22 (see WORKLOG.md): 255 is past the IMX219's own documented
+     * analog gain ceiling -- ../Camera_N6_AI_Test's comment on this same
+     * register: "Range: 0x00=1x ... 0xC0=4x ... 0xE0=8x ... 0xE8=16x(max)".
+     * Telling AEC it can go up to 255 let it drive ANALOG_GAIN past the
+     * sensor's valid range (confirmed on hardware: AEC pinned isp_gain at
+     * 255, isp_exposure at the 3522 ceiling, and the image is still dark --
+     * writes above 0xE8 are out of spec and not doing anything useful).
+     * 0xE8 = 232 is the real ceiling. */
     Info->gain_min = 0;
-    Info->gain_max = 255;
+    Info->gain_max = 232;
 
     Info->exposure_min = 1;
-    Info->exposure_max = 1762;      // FrameLength-1 (0x06E3-1)
+    /* Bug 20 (see WORKLOG.md): this was 1762 (0x06E3-1), matching the
+     * FRM_LENGTH_LINES value (0x06E3=1763) imx219.c had BEFORE Bug 18
+     * restored it to the correct 0x0DC6=3526 (../Camera_N6_AI_Test's
+     * confirmed-working value) -- this constant was never updated to match,
+     * so evision's AEC has been told the sensor's exposure ceiling is
+     * roughly HALF what it actually is ever since Bug 18's fix. Found while
+     * investigating a "flashes bright for ~1s then crushes to near-black"
+     * symptom after first enabling AECAlgo. Matches Camera_N6_AI_Test's own
+     * COARSE_INTEGRATION_TIME margin ("max - 4 lines"). */
+    Info->exposure_max = 3522;      // FrameLength(3526) - 4
 
     return ISP_OK;
 }
@@ -1160,6 +1512,90 @@ void HAL_DCMIPP_PIPE_VsyncEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
     case DCMIPP_PIPE2 :
       ISP_IncAncillaryFrameId(&hcamera_isp);
       break;
+  }
+}
+
+/**
+  * @brief  USB1_OTG_HS PCD Initialization Function (ported from
+  *         Camera_N6_AI_Test/Appli/Src/main.c -- FIFO sizing and init
+  *         sequence copied as-is; called from app_usbx_device.c's device
+  *         thread after ThreadX is running).
+  * @retval None
+  */
+void MX_USB1_OTG_HS_PCD_Init(void)
+{
+  hpcd_USB_OTG_HS1.Instance = USB1_OTG_HS;
+  hpcd_USB_OTG_HS1.Init.dev_endpoints = 9;
+  hpcd_USB_OTG_HS1.Init.speed = PCD_SPEED_HIGH;
+  hpcd_USB_OTG_HS1.Init.phy_itface = USB_OTG_HS_EMBEDDED_PHY;
+  hpcd_USB_OTG_HS1.Init.Sof_enable = DISABLE;
+  hpcd_USB_OTG_HS1.Init.low_power_enable = DISABLE;
+  hpcd_USB_OTG_HS1.Init.lpm_enable = DISABLE;
+  hpcd_USB_OTG_HS1.Init.use_dedicated_ep1 = DISABLE;
+  hpcd_USB_OTG_HS1.Init.vbus_sensing_enable = DISABLE;
+  hpcd_USB_OTG_HS1.Init.dma_enable = ENABLE;
+#ifdef USB_OTG_HS_EXTERNAL_VBUS_SUPPORT
+  hpcd_USB_OTG_HS1.Init.use_external_vbus = DISABLE;
+#endif
+
+  printf("[USB] Calling HAL_PCD_Init()...\r\n");
+  if (HAL_PCD_Init(&hpcd_USB_OTG_HS1) != HAL_OK)
+  {
+    printf("[ERROR] HAL_PCD_Init failed\r\n");
+    Error_Handler();
+  }
+  printf("[USB] HAL_PCD_Init successful\r\n");
+
+  /* Configure FIFO AFTER HAL_PCD_Init() so USB clocks/core are ready. */
+  if (HAL_PCDEx_SetRxFiFo(&hpcd_USB_OTG_HS1, 0x100) != HAL_OK)
+  {
+    printf("[ERROR] HAL_PCDEx_SetRxFiFo failed\r\n");
+    Error_Handler();
+  }
+  if (HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS1, 0, 0x10) != HAL_OK)
+  {
+    printf("[ERROR] HAL_PCDEx_SetTxFiFo EP0 failed\r\n");
+    Error_Handler();
+  }
+  if (HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS1, 1, 0x10) != HAL_OK)
+  {
+    printf("[ERROR] HAL_PCDEx_SetTxFiFo EP1 failed\r\n");
+    Error_Handler();
+  }
+  if (HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS1, 2, 0x80) != HAL_OK)
+  {
+    printf("[ERROR] HAL_PCDEx_SetTxFiFo EP2 failed\r\n");
+    Error_Handler();
+  }
+  if (HAL_PCDEx_SetTxFiFo(&hpcd_USB_OTG_HS1, 4, 0x100) != HAL_OK)
+  {
+    printf("[ERROR] HAL_PCDEx_SetTxFiFo EP4 failed\r\n");
+    Error_Handler();
+  }
+  printf("[USB] FIFO configured: RX=256w, EP0=64B, EP1=64B, EP2=512B, EP4=1024B\r\n");
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode.
+  * @note   ThreadX's tx_initialize_low_level.S claims SysTick for its own
+  *         RTOS tick once tx_kernel_enter() runs, so HAL's time base is
+  *         moved to TIM6 instead (see stm32n6xx_hal_timebase_tim.c, ported
+  *         from Camera_N6_AI_Test, which overrides the weak
+  *         HAL_InitTick()/HAL_SuspendTick()/HAL_ResumeTick()). Because that
+  *         override is linked in from HAL_Init() onward, TIM6 is actually
+  *         the tick source for the whole program, pre-RTOS init included --
+  *         this callback is what increments uwTick/HAL_GetTick() throughout,
+  *         and HAL_Delay() in the existing pre-RTOS bring-up code keeps
+  *         working exactly as before, just driven by TIM6 instead of
+  *         SysTick.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
   }
 }
 /* USER CODE END 4 */

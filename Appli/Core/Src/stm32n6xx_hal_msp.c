@@ -21,7 +21,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -119,10 +119,25 @@ void HAL_DCMIPP_MspInit(DCMIPP_HandleTypeDef* hdcmipp)
     __HAL_RCC_CSI_CLK_ENABLE();
     __HAL_RCC_CSI_FORCE_RESET();
     __HAL_RCC_CSI_RELEASE_RESET();
-    /* DCMIPP interrupt Init */
-    HAL_NVIC_SetPriority(DCMIPP_IRQn, 0, 0);
+    /* DCMIPP interrupt Init
+     *
+     * Priority 7, NOT 0 (CubeMX's original default -- fine back when this
+     * project was bare-metal, single-shot capture only). Once continuous
+     * UVC capture starts, HAL_DCMIPP_PIPE_FrameEventCallback ->
+     * Capture_OnFrameComplete() (app_threadx.c) calls tx_semaphore_put(), a
+     * ThreadX kernel API. ThreadX's critical sections only mask interrupts
+     * up to the priority level its port actually manages -- an interrupt
+     * left at priority 0 can preempt the kernel mid-update and corrupt its
+     * internal state. Symptom seen on real hardware: exactly one frame
+     * captured successfully (frame_count=1), then total silence forever,
+     * with P1SR/CMSR2 overrun flags and AXI error counters all reading 0 --
+     * i.e. not a DCMIPP/CSI hardware problem, the kernel itself got
+     * corrupted by the very first ISR call. Camera_N6_AI_Test (confirmed
+     * working with ThreadX+DCMIPP running together) uses priority 7 for
+     * both of these same interrupts -- matched here for the same reason. */
+    HAL_NVIC_SetPriority(DCMIPP_IRQn, 7, 0);
     HAL_NVIC_EnableIRQ(DCMIPP_IRQn);
-    HAL_NVIC_SetPriority(CSI_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(CSI_IRQn, 7, 0);
     HAL_NVIC_EnableIRQ(CSI_IRQn);
     /* USER CODE BEGIN DCMIPP_MspInit 1 */
 	__HAL_RCC_AXISRAM2_MEM_CLK_ENABLE();
@@ -334,6 +349,119 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
     /* USER CODE END LPUART1_MspDeInit 1 */
   }
 
+}
+
+/**
+  * @brief PCD MSP Initialization (ported from Camera_N6_AI_Test's
+  *        stm32n6xx_hal_msp.c as-is -- HSE/VDDUSB/USB PHY bring-up sequence
+  *        for USB1_OTG_HS). Added alongside the existing DCMIPP MSP
+  *        functions above; does NOT touch HAL_DCMIPP_MspInit() (see
+  *        knowledge_archive.md Bug 5 -- that function's stale default RCC
+  *        block must stay removed).
+  * @param hpcd: PCD handle pointer
+  * @retval None
+  */
+void HAL_PCD_MspInit(PCD_HandleTypeDef* hpcd)
+{
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+  if(hpcd->Instance==USB1_OTG_HS)
+  {
+    /* Enable HSE (48 MHz crystal) -- required as USB OTG/PHY reference
+     * clock source. The FSBL configures PLL1 from HSI only; HSE must be
+     * started here for USB. */
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+      printf("[ERROR] HSE enable failed\r\n");
+      Error_Handler();
+    }
+
+    /* Enable VDDUSB supply */
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWREx_EnableVddUSBVMEN();
+    while (__HAL_PWR_GET_FLAG(PWR_FLAG_USB33RDY)); /* wait for monitoring to settle */
+    HAL_PWREx_EnableVddUSB();
+
+    /* Initialize USB OTG/PHY peripheral clocks */
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USBOTGHS1;
+    PeriphClkInitStruct.UsbOtgHs1ClockSelection = RCC_USBOTGHS1CLKSOURCE_HSE_DIRECT;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      printf("[ERROR] USB OTG clock config failed\r\n");
+      Error_Handler();
+    }
+
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USBPHY1;
+    PeriphClkInitStruct.UsbPhy1ClockSelection = RCC_USBPHY1REFCLKSOURCE_HSE_DIRECT;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      printf("[ERROR] USB PHY clock config failed\r\n");
+      Error_Handler();
+    }
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    LL_AHB5_GRP1_ForceReset(0x00800000);
+    __HAL_RCC_USB1_OTG_HS_FORCE_RESET();
+    __HAL_RCC_USB1_OTG_HS_PHY_FORCE_RESET();
+    LL_RCC_HSE_SelectHSEDiv2AsDiv2Clock();
+    LL_AHB5_GRP1_ReleaseReset(0x00800000);
+
+    /* Peripheral clock enable */
+    __HAL_RCC_USB1_OTG_HS_CLK_ENABLE();
+
+    /* Allow a few cycles for the clock to stabilise before accessing PHY registers */
+    HAL_Delay(1);
+
+    /* Configure USB PHY controller: reference clock = 48 MHz (FSEL=0x2), enable PLL.
+     * CRITICAL: Clear VATESTENB(bit16) first -- it blocks HS chirp-K if left set from POR. */
+    USB1_HS_PHYC->USBPHYC_CR &= ~((0x7U << 4U) | (0x1U << 16U));
+    USB1_HS_PHYC->USBPHYC_CR |= (0x2U << 4U)  |  /* FSEL: 48 MHz reference clock  */
+                                 (0x1U << 2U)  |  /* COMMONONN: common block on     */
+                                  0x1U;           /* STARTCLKGEN: start PLL         */
+
+    __HAL_RCC_USB1_OTG_HS_PHY_RELEASE_RESET();
+
+    /* Wait for PHY to complete reset sequence */
+    HAL_Delay(1);
+
+    __HAL_RCC_USB1_OTG_HS_RELEASE_RESET();
+
+    /* Peripheral PHY clock enable */
+    __HAL_RCC_USB1_OTG_HS_PHY_CLK_ENABLE();
+
+    HAL_NVIC_SetPriority(USB1_OTG_HS_IRQn, 7, 0);
+    HAL_NVIC_EnableIRQ(USB1_OTG_HS_IRQn);
+    printf("[HAL_PCD_MSP] USB1 OTG HS clock/PHY/IRQ configured\r\n");
+  }
+}
+
+/**
+  * @brief PCD MSP De-Initialization
+  * @param hpcd: PCD handle pointer
+  * @retval None
+  */
+void HAL_PCD_MspDeInit(PCD_HandleTypeDef* hpcd)
+{
+  if(hpcd->Instance==USB1_OTG_HS)
+  {
+    /* Peripheral clock disable */
+    __HAL_RCC_USB1_OTG_HS_CLK_DISABLE();
+
+    /* Disable VDDUSB */
+    if(__HAL_RCC_PWR_IS_CLK_ENABLED())
+    {
+      __HAL_RCC_PWR_CLK_ENABLE();
+      HAL_PWREx_DisableVddUSB();
+      __HAL_RCC_PWR_CLK_DISABLE();
+    }
+    else
+    {
+      HAL_PWREx_DisableVddUSB();
+    }
+  }
 }
 
 /* USER CODE BEGIN 1 */

@@ -32,8 +32,26 @@ static const ISP_IQParamTypeDef ISP_IQParamCacheInit_IMX219 = {
     .sensorExposureStatic = {
         .exposure = 0,
     },
+    /*
+     * Color/exposure fix (see WORKLOG.md): this file was ST's "DUMMY sensor"
+     * template with every IQ block left disabled except demosaicing -- the
+     * dark/greenish image reported after Bug 19 fixed the striping is this
+     * config, not a new bug. AECAlgo/ispGainStatic below are the two
+     * cheapest, already-fully-wired blocks to turn on (evision's ST-AE
+     * library is already loaded, ISP_BackgroundProcess() already pumps it
+     * every frame in both main.c's warmup loop and app_threadx.c's UVC
+     * loop, and main.c's SetSensorGainHelper/SetSensorExposureHelper
+     * already drive real IMX219 I2C writes -- this was just never enabled).
+     * AWBAlgo is left disabled: its multi-profile color-temperature table
+     * (id/referenceColorTemp/coeff per profile) needs real calibration
+     * captures (normally done with ST's X-CUBE-ISP tool) that don't exist
+     * for this sensor/module yet -- enabling it with all-empty/zero
+     * profiles would be worse than leaving it off. ispGainStatic below is
+     * a static, uncalibrated placeholder for white balance in the
+     * meantime, not a substitute for real AWB tuning.
+     */
     .AECAlgo = {
-        .enable = 0,
+        .enable = 1,
         .exposureCompensation = EXPOSURE_TARGET_0_0_EV,
         .antiFlickerFreq = 0,
     },
@@ -64,11 +82,39 @@ static const ISP_IQParamTypeDef ISP_IQParamCacheInit_IMX219 = {
         .lineH = 0,
         .edge = 0,
     },
+    /* Bug 23 (see WORKLOG.md): Bug 22's "digital brightness boost" here
+     * (doubling these gains to 3.0/2.0/2.8x) was WRONG and made things
+     * worse. Traced into isp_algo.c: the AEC algorithm's luminance metric
+     * (`stats.down.averageL`, ~line 447) is measured on data that ALREADY
+     * has this ispGainStatic multiplication applied (confirmed by
+     * isp_algo.c ~line 568, which reverses it: `up = down * FACTOR /
+     * ISPGain.ispGainR` -- to back-compute a pre-gain estimate from a
+     * post-gain reading, meaning "down" is post-gain). So boosting this
+     * gain doesn't add brightness AEC can't already control -- it LIES to
+     * AEC's own metering, making the scene look brighter than it really is
+     * and causing AEC to drive real sensor exposure/gain DOWN to
+     * compensate. Confirmed on hardware: under bright room light, AEC
+     * correctly reacted to the extra light by driving exposure to `1`
+     * (the minimum) and gain to `0` -- but the displayed image was worse
+     * than before (flat, textureless, no visible detail at all), because
+     * exposure=1 is far too short to capture real signal, and this gain
+     * was then amplifying near-black sensor noise into a flat mid-tone
+     * instead of an actual image.
+     *
+     * Reverted to plain white-balance-only ratios (no extra magnitude) --
+     * letting AEC's own exposure/sensor-gain loop be the only thing
+     * controlling brightness, since that's the control loop this ISP
+     * actually meters against. Unit is 100000000 = x1.0, max supported is
+     * x16. R:G:B ratio (~1.5:1.0:1.4) is still the
+     * ../Camera_N6_AI_Test-inspired daylight ballpark, NOT independently
+     * calibrated for this module. Only takes effect while AWBAlgo.enable
+     * is 0 (see isp_core.c's ApplyIQParams -- AWB, once configured, would
+     * take over this field). */
     .ispGainStatic = {
-        .enable = 0,
-        .ispGainR = 0,
-        .ispGainG = 0,
-        .ispGainB = 0,
+        .enable = 1,
+        .ispGainR = 150000000,
+        .ispGainG = 100000000,
+        .ispGainB = 140000000,
     },
     .colorConvStatic = {
         .enable = 0,

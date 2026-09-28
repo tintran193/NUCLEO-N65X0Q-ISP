@@ -63,6 +63,16 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined libraries
 )
 
+# JPEG encode + RGB565->YUV422 pixel conversion + UVC payload assembly are
+# the UVC streaming hot path; Debug builds are otherwise unoptimized (-O0)
+# which would make the stream unusably slow. Force -O2 for just these.
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/app_cvt.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/app_jpg.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/ux_device_video.c
+    PROPERTIES COMPILE_FLAGS "-O2"
+)
+
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 

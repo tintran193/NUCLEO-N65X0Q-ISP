@@ -585,6 +585,52 @@ ok
 
 **Kết quả trên board thật** (sau khi fix này và một số bug khác không liên quan — I2C2 bị RIF khoá, thiếu `HAL_GPIO_Init()` cho chân reset/enable camera, thiếu cấu hình clock CSI D-PHY; xem `WORKLOG.md` để biết chi tiết đầy đủ): `P1SR = 0x00020007` (`OVRF=0`), `CMSR2` (`P1OVRF=0`), `Non-zero bytes = 614400 / 614400 (100%)`. Overrun đã hết, frame nhận đủ và đúng.
 
+## USB Video Class (UVC) streaming
+
+Added on top of the PIPE1 capture above: a ThreadX+USBX pipeline that streams the camera
+live over USB as MJPEG (UVC), so any PC can view it in VLC/guvcview/Windows Camera without
+extra software. See `WORKLOG.md`'s dated entry for the full file-by-file breakdown (what was
+ported from `Camera_N6_AI_Test`, what's new, what was merged) and `knowledge_archive.md` for
+the underlying camera bring-up this sits on top of.
+
+**Color path decision**: `Camera_N6_AI_Test` (a sibling project with a working UVC pipeline on
+this same board) drives DCMIPP's own hardware Bayer2RGB with hand-picked
+`DCMIPP_ExposureConfTypeDef` white-balance multipliers (`MultiplierRed=195`,
+`MultiplierBlue=185`, etc.) and a hand-tuned RGB→YUV matrix — the user confirmed this produces
+visibly wrong color. This project's PIPE1 already outputs `DCMIPP_PIXEL_PACKER_FORMAT_RGB565_1`
+through the real `ISP_MW/evision` AWB/AE algorithms (see §"PIPE1 - RAW10-RGB" above), which is
+what the UVC pipeline encodes instead — `app_jpg.c` gained a `JPG_SRC_RGB565` case that calls
+`CVT_FormatRgb565ToYuv422Jpeg()` (already present, unused, in the ported `app_cvt.c`) rather
+than routing through YUV422/manual-WB at all.
+
+**New capture thread (`Appli/Core/Src/app_threadx.c`, written from scratch for this project)**:
+restarts PIPE1 in `DCMIPP_MODE_CONTINUOUS` (the pre-RTOS code above only ever ran it in
+`DCMIPP_MODE_SNAPSHOT`, once, for verification), keeps `ISP_BackgroundProcess()` pumped so AWB/AE
+keeps converging while streaming, and implements the same double-buffer/ping-pong swap the
+reference project uses to stop the capture DMA from overwriting a frame UVC is still
+transmitting. RAM is tight (2MB, no PSRAM) with ThreadX+USBX+JPEG added on top, so `video_buf[0]`
+deliberately reuses the exact same fixed-address memory (`camera_framebuffer` /
+`CAMERA_BUFFER_ADDR`) the single-shot verification used — that memory is free again once the
+verification finishes and PIPE1 stops, saving ~600KB.
+
+**Why the single-shot warmup callback and the continuous-streaming callback share one function**:
+`main.c`'s `HAL_DCMIPP_PIPE_FrameEventCallback` was already a hard (non-weak) override used by
+the pre-RTOS single-shot warmup/verification. Only one definition of a HAL callback can exist in
+the link, so rather than duplicating it in `app_threadx.c`, that existing callback now also calls
+`Capture_OnFrameComplete()` (defined in `app_threadx.c`) whenever `uvc_capture_active` is set —
+the two modes never overlap in time (PIPE1 is stopped between the snapshot and the continuous
+restart), so this is safe.
+
+**Needs real hardware testing next** (none of this can be verified without hardware):
+- Does the board enumerate as a USB Video device on a PC at all (check `lsusb`/Device Manager)?
+- Does a UVC viewer (VLC, guvcview, Windows Camera app) show a valid, non-corrupt MJPEG stream?
+- What frame rate is actually achieved (`[UVC_CAP]`/`[UVC]` printf diagnostics report this over
+  the serial console)?
+- Does the color now look correct (the entire point of choosing RGB565/evision over
+  `Camera_N6_AI_Test`'s YUV422/manual-WB path)?
+- Does AWB/AE keep converging while streaming continuously (it's only ever been exercised for
+  ~60 frames of warmup before, never for a sustained continuous capture)?
+
 ## Tài liệu tham khảo:
 [1] RM0486 - Reference manual, https://www.st.com/resource/en/reference_manual/rm0486-stm32n6x5x7xx-armbased-32bit-mcus-stmicroelectronics.pdf
 [2] AN6211 - Digital camera interface pixel pipeline description, https://www.st.com/resource/en/application_note/an6211-introduction-to-digital-camera-interface-pixel-pipeline-for-stm32-mcus-stmicroelectronics.pdf

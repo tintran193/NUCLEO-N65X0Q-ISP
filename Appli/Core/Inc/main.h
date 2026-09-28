@@ -73,7 +73,7 @@ typedef funcptr funcptr_NS;
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+void MX_USB1_OTG_HS_PCD_Init(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
